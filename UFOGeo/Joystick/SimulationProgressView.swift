@@ -1,6 +1,7 @@
 import SwiftUI
 struct SimulationProgressView: View {
     @ObservedObject var modeManager: JoystickModeManager
+    @ObservedObject var healthCoordinator: HealthWalkingCoordinator
     let route: SimulationRoute
     @Binding var speed: Double
     let onStop: () -> Void
@@ -35,6 +36,13 @@ struct SimulationProgressView: View {
 
             ProgressView(value: modeManager.simulationProgress)
                 .tint(.blue)
+
+            HStack {
+                Label("累計 \(healthCoordinator.pendingSteps)", systemImage: "figure.walk")
+                Spacer()
+                Text("剩餘 \(healthCoordinator.remainingSteps) 步")
+            }
+            .font(.caption.monospacedDigit())
 
             HStack(spacing: 10) {
                 Button {

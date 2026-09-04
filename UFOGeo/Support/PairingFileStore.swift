@@ -2,7 +2,7 @@ import Foundation
 import UniformTypeIdentifiers
 
 extension Notification.Name {
-    static let pairingFileDidChange = Notification.Name("com.ufogo.pairing-file-did-change")
+    static let pairingFileDidChange = Notification.Name("com.ufogeo.pairing-file-did-change")
 }
 
 enum PairingFileError: LocalizedError, Equatable {
@@ -10,6 +10,7 @@ enum PairingFileError: LocalizedError, Equatable {
     case invalidPropertyList
     case missingRequiredFields([String])
     case invalidField(String)
+    case unsupportedFileExtension(String)
 
     var errorDescription: String? {
         switch self {
@@ -21,12 +22,15 @@ enum PairingFileError: LocalizedError, Equatable {
             return "配對文件缺少必要欄位：\(fields.joined(separator: "、"))。"
         case .invalidField(let field):
             return "配對文件欄位 \(field) 的格式無效。"
+        case .unsupportedFileExtension(let fileExtension):
+            let suffix = fileExtension.isEmpty ? "（無副檔名）" : ".\(fileExtension)"
+            return "不支援的配對文件副檔名：\(suffix)。請選擇 .plist、.mobiledevicepairing 或 .mobiledevicepair。"
         }
     }
 }
 
 enum PairingFileStore {
-    static let fileName = "rp_pairing_file.plist"
+    private static let fileName = "rp_pairing_file.plist"
     private static let maximumFileSize = 10 * 1_024 * 1_024
     private static let requiredStringFields = ["HostID", "SystemBUID"]
     private static let requiredDataFields = [
@@ -36,16 +40,18 @@ enum PairingFileStore {
         "RootCertificate",
         "RootPrivateKey"
     ]
-    private static let provisionedFileNames = [
-        fileName,
-        "pairingFile.plist",
-        "pairing.mobiledevicepairing",
-        "pairing.mobiledevicepair"
-    ]
     static let supportedContentTypes: [UTType] = [
-        UTType(filenameExtension: "mobiledevicepairing", conformingTo: .data)!,
-        UTType(filenameExtension: "mobiledevicepair", conformingTo: .data)!,
-        .propertyList
+        // Use extension-tagged dynamic types rather than a generic `.data`
+        // or `.propertyList` type. UIDocumentPicker will then limit manual
+        // selection to exactly these three filename extensions.
+        UTType(filenameExtension: "plist")!,
+        UTType(filenameExtension: "mobiledevicepairing")!,
+        UTType(filenameExtension: "mobiledevicepair")!
+    ]
+    static let supportedFileExtensions: Set<String> = [
+        "plist",
+        "mobiledevicepairing",
+        "mobiledevicepair"
     ]
 
     static var url: URL {
@@ -56,20 +62,21 @@ enum PairingFileStore {
     static func prepareURL(fileManager: FileManager = .default) -> URL {
         let destination = url
         try? fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        protectPairingDirectory(at: directoryURL, fileManager: fileManager)
 
         guard !fileManager.fileExists(atPath: destination.path) else {
-            removeLegacyCopies(fileManager: fileManager)
+            protectPairingFile(at: destination, fileManager: fileManager)
             return destination
         }
 
-        migrateProvisionedCopy(to: destination, fileManager: fileManager)
         return destination
     }
 
-    static func replace(with sourceURL: URL, fileManager: FileManager = .default) throws {
+    private static func replace(with sourceURL: URL, fileManager: FileManager) throws {
         let destination = url
         try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
-        let data = try Data(contentsOf: sourceURL, options: .mappedIfSafe)
+        protectPairingDirectory(at: directoryURL, fileManager: fileManager)
+        let data = try coordinatedData(from: sourceURL)
         try validate(data)
 
         guard sourceURL.standardizedFileURL != destination.standardizedFileURL else {
@@ -77,7 +84,6 @@ enum PairingFileStore {
             return
         }
 
-        removeLegacyCopies(fileManager: fileManager)
         try data.write(to: destination, options: .atomic)
         protectPairingFile(at: destination, fileManager: fileManager)
         notifyPairingFileDidChange()
@@ -124,6 +130,11 @@ enum PairingFileStore {
     }
 
     static func importFromPicker(_ sourceURL: URL, fileManager: FileManager = .default) throws {
+        let fileExtension = sourceURL.pathExtension.lowercased()
+        guard supportedFileExtensions.contains(fileExtension) else {
+            throw PairingFileError.unsupportedFileExtension(sourceURL.pathExtension)
+        }
+
         let accessing = sourceURL.startAccessingSecurityScopedResource()
         defer {
             if accessing {
@@ -138,79 +149,75 @@ enum PairingFileStore {
         try replace(with: sourceURL, fileManager: fileManager)
     }
 
-    static func remove(fileManager: FileManager = .default) throws {
-        let destination = prepareURL(fileManager: fileManager)
-        if fileManager.fileExists(atPath: destination.path) {
-            try fileManager.removeItem(at: destination)
-        }
-        removeLegacyCopies(fileManager: fileManager)
-        notifyPairingFileDidChange()
-    }
-
     private static var directoryURL: URL {
         FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Pairing", isDirectory: true)
     }
 
-    private static var provisionedURLs: [URL] {
-        let documents = URL.documentsDirectory
-        let inbox = documents.appendingPathComponent("Inbox", isDirectory: true)
-        let containerURLs = provisionedFileNames.flatMap { name in
-            [documents.appendingPathComponent(name), inbox.appendingPathComponent(name)]
-        }
-        let bundledURLs = provisionedFileNames.compactMap { name -> URL? in
-            let fileURL = URL(fileURLWithPath: name)
-            return Bundle.main.url(
-                forResource: fileURL.deletingPathExtension().lastPathComponent,
-                withExtension: fileURL.pathExtension
-            )
-        }
-        let extensions = Set(["plist", "mobiledevicepairing", "mobiledevicepair"])
-        let searchableDirectories = [documents, inbox, Bundle.main.bundleURL]
-        let wildcardURLs = searchableDirectories.flatMap { directory in
-            let urls = (try? FileManager.default.contentsOfDirectory(
-                at: directory,
-                includingPropertiesForKeys: [.isRegularFileKey],
-                options: [.skipsHiddenFiles]
-            )) ?? []
-            return urls.filter { url in
-                extensions.contains(url.pathExtension.lowercased())
-                    && (url.lastPathComponent.lowercased().contains("pair")
-                        || url.pathExtension.lowercased().hasPrefix("mobiledevicepair"))
-            }
-        }
-        return Array(Set(containerURLs + bundledURLs + wildcardURLs))
-    }
+    private static func coordinatedData(from sourceURL: URL) throws -> Data {
+        var coordinatedData: Data?
+        var readError: Error?
+        var coordinationError: NSError?
 
-    private static func migrateProvisionedCopy(to destination: URL, fileManager: FileManager) {
-        for sourceURL in provisionedURLs where fileManager.fileExists(atPath: sourceURL.path) {
+        let coordinator = NSFileCoordinator(filePresenter: nil)
+        coordinator.coordinate(
+            readingItemAt: sourceURL,
+            options: [],
+            error: &coordinationError
+        ) { coordinatedURL in
             do {
-                let data = try Data(contentsOf: sourceURL, options: .mappedIfSafe)
-                try validate(data)
-                try data.write(to: destination, options: .atomic)
-                if !sourceURL.path.hasPrefix(Bundle.main.bundleURL.path) {
-                    try fileManager.removeItem(at: sourceURL)
-                }
+                coordinatedData = try Data(contentsOf: coordinatedURL, options: .mappedIfSafe)
             } catch {
-                continue
+                readError = error
             }
-
-            protectPairingFile(at: destination, fileManager: fileManager)
-            break
         }
+
+        if let coordinationError {
+            throw coordinationError
+        }
+        if let readError {
+            throw readError
+        }
+        guard let coordinatedData else {
+            throw CocoaError(.fileReadUnknown)
+        }
+        return coordinatedData
     }
 
-    private static func removeLegacyCopies(fileManager: FileManager) {
-        for sourceURL in provisionedURLs
-        where !sourceURL.path.hasPrefix(Bundle.main.bundleURL.path)
-            && fileManager.fileExists(atPath: sourceURL.path) {
-            try? fileManager.removeItem(at: sourceURL)
-        }
+    private static func protectPairingDirectory(at url: URL, fileManager: FileManager) {
+        applySensitiveDataProtection(
+            at: url,
+            permissions: 0o700,
+            fileManager: fileManager
+        )
     }
 
     private static func protectPairingFile(at url: URL, fileManager: FileManager) {
-        try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        applySensitiveDataProtection(
+            at: url,
+            permissions: 0o600,
+            fileManager: fileManager
+        )
+    }
+
+    private static func applySensitiveDataProtection(
+        at url: URL,
+        permissions: Int,
+        fileManager: FileManager
+    ) {
+        try? fileManager.setAttributes(
+            [
+                .posixPermissions: permissions,
+                .protectionKey: FileProtectionType.completeUntilFirstUserAuthentication
+            ],
+            ofItemAtPath: url.path
+        )
+
+        var protectedURL = url
+        var resourceValues = URLResourceValues()
+        resourceValues.isExcludedFromBackup = true
+        try? protectedURL.setResourceValues(resourceValues)
     }
 
     private static func notifyPairingFileDidChange() {

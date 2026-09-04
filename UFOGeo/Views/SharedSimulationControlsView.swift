@@ -6,11 +6,14 @@ struct SharedSimulationControlsView: View {
     @Environment(\.adaptiveLayout) private var layout
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage(UserDefaults.Keys.lastJoystickSpeed) private var speed: Double = 10
+    @AppStorage(UserDefaults.Keys.healthWalkingEnabled) private var healthWalkingEnabled = false
     @StateObject private var searchCompleter = LocationSearchCompleter()
+    @StateObject private var portaly = PortalyCheckoutService.shared
     @State private var searchText = ""
     @State private var showResults = false
     @State private var isApplyingSearchSelection = false
     @State private var showSpeedEditor = false
+    @State private var showJoystickUpgradePrompt = false
     @State private var pairingExists: Bool = false
 
     var body: some View {
@@ -74,7 +77,15 @@ struct SharedSimulationControlsView: View {
             searchCompleter.update(query: value)
         }
         .onReceive(searchCompleter.$results) { results in
-            showResults = showResults && !searchText.isEmpty && !results.isEmpty
+            let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+            showResults = !trimmed.isEmpty
+                && CoordinateParser.parse(searchText) == nil
+                && !results.isEmpty
+        }
+        .alert("搖桿移動是 Pro 功能", isPresented: $showJoystickUpgradePrompt) {
+            Button("知道了", role: .cancel) { }
+        } message: {
+            Text("Free 可在前景或背景維持單一位置，且不設產品層時間上限；實際背景執行仍受 iOS 權限與系統排程影響。")
         }
     }
 
@@ -94,6 +105,7 @@ struct SharedSimulationControlsView: View {
         )
     }
 
+    @ViewBuilder
     private var speedControl: some View {
         ExpandableSpeedPanel(
             speed: sharedSpeedBinding,
@@ -126,8 +138,9 @@ struct SharedSimulationControlsView: View {
                         .fill(connectionColor)
                         .frame(width: 12, height: 12)
                         .overlay(Circle().stroke(Color(.systemBackground), lineWidth: 2))
-            }
+                }
             utilityButton("bookmark.fill", color: .accentColor, action: .bookmarks)
+            utilityButton("figure.walk", color: healthWalkingEnabled ? .green : .accentColor, action: .walking)
             HStack(spacing: 8) {
                 utilityButton(
                     "house.fill",
@@ -280,7 +293,8 @@ struct SharedSimulationControlsView: View {
             sharedMapState.requestedControlAction = .directLocation
             return
         }
-        if !searchText.isEmpty, let first = searchCompleter.results.first {
+        if !searchText.isEmpty,
+           let first = searchCompleter.firstResult(matching: searchText) {
             selectResult(first, directlyLocate: true)
             return
         }

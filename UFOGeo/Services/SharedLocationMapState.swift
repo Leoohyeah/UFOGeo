@@ -7,6 +7,7 @@ import SwiftUI
 enum SharedControlAction: Equatable {
     case settings
     case bookmarks
+    case walking
     case returnToRealLocation
     case locationRefreshCycle
     case recenter
@@ -50,6 +51,17 @@ struct NativeMapCenterRequest {
     let id = UUID()
     let coordinate: CLLocationCoordinate2D
     let preserveZoom: Bool
+    let resumesRouteFollowing: Bool
+
+    init(
+        coordinate: CLLocationCoordinate2D,
+        preserveZoom: Bool,
+        resumesRouteFollowing: Bool = false
+    ) {
+        self.coordinate = coordinate
+        self.preserveZoom = preserveZoom
+        self.resumesRouteFollowing = resumesRouteFollowing
+    }
 }
 
 struct AdaptiveLayoutMetrics {
@@ -69,9 +81,25 @@ struct AdaptiveLayoutMetrics {
     var controlButtonSize: CGFloat { min(max(44, 46 * widthScale), 50) }
     var joystickSize: CGFloat { min(max(84, 100 * min(widthScale, heightScale)), 104) }
     var bottomControlInset: CGFloat { min(max(82, 90 * heightScale), 96) }
-    var compactPanelHeight: CGFloat { min(max(125, 119 * heightScale), 131) }
-    var joystickBottomInset: CGFloat {
-        bottomControlInset + compactPanelHeight + min(max(30, 40 * heightScale), 44)
+    /// The bottom simulation cards use the same responsive heights on both tabs.
+    /// Keep the active height large enough for the route progress controls while
+    /// allowing the location card to reserve the same space for its health row.
+    var inactiveSimulationCardHeight: CGFloat {
+        min(max(125, 119 * heightScale), 131)
+    }
+
+    var activeSimulationCardHeight: CGFloat {
+        min(max(155, 164 * heightScale), 163)
+    }
+
+    func simulationCardHeight(isActive: Bool) -> CGFloat {
+        isActive ? activeSimulationCardHeight : inactiveSimulationCardHeight
+    }
+
+    func joystickBottomInset(isSimulationActive: Bool) -> CGFloat {
+        bottomControlInset
+            + simulationCardHeight(isActive: isSimulationActive)
+            + min(max(30, 40 * heightScale), 44)
     }
     var topControlSpacing: CGFloat { min(max(7, 10 * heightScale), 11) }
 }
@@ -110,6 +138,7 @@ final class SharedLocationMapState: ObservableObject {
     var lastCamera: MapCamera?
     @Published var nativeMapCenterRequest: NativeMapCenterRequest?
     @Published var isSimulationActive = false
+    @Published var isSimulationTransitioning = false
     @Published var isMovementActive = false
     @Published var simulationSpeed = min(
         max(UserDefaults.standard.object(forKey: UserDefaults.Keys.lastJoystickSpeed) as? Double ?? 10, 0),
@@ -129,7 +158,11 @@ final class SharedLocationMapState: ObservableObject {
     private var pendingForcedTunnelRetest = false
     private var lastTunnelTestAt: Date = .distantPast
 
-    var canSwitchTabs: Bool { !isSimulationActive }
+    var isSimulationInteractionLocked: Bool {
+        isSimulationActive || isSimulationTransitioning
+    }
+
+    var canSwitchTabs: Bool { !isSimulationInteractionLocked }
 
     /// 保存本次 process 啟動後取得的第一個有效真實座標。
     @discardableResult
@@ -194,7 +227,7 @@ final class SharedLocationMapState: ObservableObject {
                 }
             }
         }
-        connection.start(queue: DispatchQueue(label: "com.ufogo.startup-tunnel"))
+        connection.start(queue: DispatchQueue(label: "com.ufogeo.startup-tunnel"))
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self, weak connection] in
             guard let self, let connection,
                   self.tunnelConnection === connection,

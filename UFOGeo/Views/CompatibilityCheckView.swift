@@ -1,11 +1,16 @@
 import CoreLocation
 import SwiftUI
 
+enum CompatibilityCheckScrollTarget {
+    case walkingHealth
+}
+
 struct CompatibilityCheckView: View {
     var onImportPairing: (() -> Void)?
     var onImportCoordinates: (() -> Void)?
     var onOpenSavedItems: (() -> Void)?
     var savedItemsTitle: String = "收藏位置"
+    var initialScrollTarget: CompatibilityCheckScrollTarget?
 
     private enum TunnelStatus: Equatable {
         case testing, reachable
@@ -15,16 +20,35 @@ struct CompatibilityCheckView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
     @EnvironmentObject private var sharedMapState: SharedLocationMapState
+    @ObservedObject private var healthCoordinator = HealthWalkingCoordinator.shared
+    @ObservedObject private var portaly = PortalyCheckoutService.shared
     @AppStorage(UserDefaults.Keys.lastJoystickSpeed) private var simulationSpeed: Double = 10
     @AppStorage(UserDefaults.Keys.routeCompletionMode) private var completionModeRaw: String = PathCompletionMode.stopAtLast.rawValue
     @AppStorage(UserDefaults.Keys.routePlanningMode) private var routePlanningModeRaw: String = RoutePlanningMode.direct.rawValue
     @AppStorage(UserDefaults.Keys.routeOrbitRadiusMeters) private var routeOrbitRadiusMeters: Int = 30
+    @State private var showHealthPermissionAlert = false
     @State private var showSupportAlert = false
+    @State private var supportAlertTitle = "贊助 UFOGeo"
+    @State private var supportAlertMessage = "贊助連結尚未設定。"
+    @State private var healthAlertTitle = "健康權限"
+    @State private var healthPermissionMessage = ""
+    @State private var directHealthStepsText = ""
+    @State private var isWritingDirectSteps = false
     @State private var simulationSpeedText = "10"
     @State private var simulationSpeedSlider = 10.0
     @State private var isDraggingSimulationSpeed = false
     @State private var pairingExists = false
+    @State private var didInitialScroll = false
+    @State private var batchSizeText = ""
+    @State private var targetText = ""
+    @State private var isTargetInputDirty = false
     @FocusState private var isSimulationSpeedFocused: Bool
+    @FocusState private var isBatchSizeFocused: Bool
+    @FocusState private var isTargetFocused: Bool
+
+    private enum SectionID {
+        static let walkingHealth = "walking-health-section"
+    }
 
     private let supportURL: URL? = URL(string: "https://portaly.cc/leoohyeah/support")
 
@@ -44,21 +68,19 @@ struct CompatibilityCheckView: View {
 
     var body: some View {
         NavigationStack {
-            List {
+            ScrollViewReader { proxy in
+                List {
                     Section {
                         connectionOverview
                         compactStatusRow("配對文件", value: pairingExists ? "已就緒" : "需要導入",
                                          color: pairingExists ? .green : .orange)
                         compactStatusRow("VPN Tunnel", value: tunnelCompactText, color: tunnelCompactColor)
-                        compactStatusRow("定位權限", value: locationAuthorizationText,
+                        compactStatusRow("背景定位權限", value: locationAuthorizationText,
                                          color: locationAuthorizationColor)
 
                         settingsAction("手動匯入配對文件", icon: "doc.badge.plus",
                                        color: pairingExists ? .accentColor : .orange) {
-                            dismiss()
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                                onImportPairing?()
-                            }
+                            onImportPairing?()
                         }
 
                         if pairingExists, case .failed = tunnelStatus {
@@ -107,7 +129,7 @@ struct CompatibilityCheckView: View {
                     } header: {
                         Text("速度")
                     } footer: {
-                        Text("定位與路線共用此速度設定，範圍為 0–1000 km/hr。")
+                        Text("此速度用於 Pro 搖桿移動與路線模擬，範圍為 0–1000 km/hr。")
                     }
 
                     Section {
@@ -138,18 +160,54 @@ struct CompatibilityCheckView: View {
                         Text("可分別設定到達終點行為與路徑規劃方式。")
                     }
 
-                    Section("資料管理") {
-                        settingsAction(savedItemsTitle, icon: "bookmark.fill") {
-                            dismiss()
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                                onOpenSavedItems?()
+                    Section {
+                        Toggle(isOn: healthWalkingBinding) {
+                            Label("步行與健康同步", systemImage: "figure.walk")
+                        }
+                        .id(SectionID.walkingHealth)
+                        Picker("增加頻率", selection: walkingRateBinding) {
+                            ForEach(1...3, id: \.self) { rate in
+                                Text("\(rate) 步/秒").tag(rate)
                             }
                         }
-                        settingsAction("匯入座標路線", icon: "square.and.arrow.down") {
-                            dismiss()
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                                onImportCoordinates?()
+                        .pickerStyle(.segmented)
+                        .disabled(!portaly.isPro)
+                    } header: {
+                        Text("步行與健康")
+                    }
+
+                    Section("步數進度") {
+                        LabeledContent("目前累計", value: "\(healthCoordinator.pendingSteps) 步")
+                        LabeledContent("剩餘步數", value: "\(displayedRemainingSteps) 步")
+                    }
+
+                    healthWriteSettingsSection
+
+                    Section {
+                        HStack(spacing: 10) {
+                            TextField("直接寫入步數", text: $directHealthStepsText)
+                                .monospacedDigit()
+                                .numericInputStyle()
+                                .disabled(!canEditStepSettings)
+                            Button("GO") {
+                                KeyboardDismissal.dismiss()
+                                writeDirectHealthSteps()
                             }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(!canEditStepSettings || directHealthStepCount == nil || isWritingDirectSteps)
+                        }
+                    } header: {
+                        Text("直接寫入健康")
+                    } footer: {
+                        Text("輸入步數後按 GO，會立即新增一筆 Apple 健康步數資料。")
+                    }
+
+                    Section("資料管理") {
+                        settingsAction(savedItemsTitle, icon: "bookmark.fill") {
+                            onOpenSavedItems?()
+                        }
+                        settingsAction("匯入座標路線", icon: "square.and.arrow.down") {
+                            onImportCoordinates?()
                         }
                     }
 
@@ -162,10 +220,18 @@ struct CompatibilityCheckView: View {
                     }
 
                     Section {
+                        NavigationLink {
+                            SubscriptionAccountView()
+                        } label: {
+                            Label("帳號與 Pro 訂閱", systemImage: "person.crop.circle.badge.checkmark")
+                        }
+
                         Button {
                             if let supportURL {
                                 openURL(supportURL)
                             } else {
+                                supportAlertTitle = "贊助 UFOGeo"
+                                supportAlertMessage = "贊助連結尚未設定。"
                                 showSupportAlert = true
                             }
                         } label: {
@@ -174,13 +240,15 @@ struct CompatibilityCheckView: View {
                     } header: {
                         Text("支持 UFOGeo")
                     } footer: {
-                        Text("如果喜歡UFOGeo，歡迎贊助作者。")
+                        Text("透過 Portaly 安全結帳；付款、續訂取消與管理變更都會以伺服器回呼同步到 App。也歡迎單次贊助作者。")
                     }
                 }
-            .alert("贊助 UFOGeo", isPresented: $showSupportAlert) {
-                Button("確定", role: .cancel) { }
-            } message: {
-                Text("贊助連結尚未設定。")
+                .onAppear {
+                    scrollToRequestedSection(proxy)
+                }
+                .onChange(of: initialScrollTarget) { _, _ in
+                    scrollToRequestedSection(proxy)
+                }
             }
             .navigationTitle("設定")
             .navigationBarTitleDisplayMode(.inline)
@@ -188,16 +256,22 @@ struct CompatibilityCheckView: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("完成") {
                         commitSimulationSpeedInput()
+                        commitBatchSizeInput()
+                        commitTargetInput()
                         dismiss()
                     }
                 }
             }
             .onAppear {
                 refreshConnectionStatus()
+                healthCoordinator.refreshEntitlement()
                 let speed = min(max(simulationSpeed, 0), 1000)
                 sharedMapState.simulationSpeed = speed
                 simulationSpeedText = String(Int(speed))
                 simulationSpeedSlider = speed
+                batchSizeText = String(healthCoordinator.batchSize)
+                targetText = String(healthCoordinator.target)
+                isTargetInputDirty = false
             }
             .onReceive(NotificationCenter.default.publisher(for: .pairingFileDidChange)) { _ in
                 refreshConnectionStatus()
@@ -210,6 +284,68 @@ struct CompatibilityCheckView: View {
                 guard !isSimulationSpeedFocused else { return }
                 simulationSpeedText = String(Int(min(max(value, 0), 1000)))
             }
+            .onChange(of: healthCoordinator.batchSize) { _, value in
+                guard !isBatchSizeFocused else { return }
+                batchSizeText = String(value)
+            }
+            .onChange(of: healthCoordinator.target) { _, value in
+                guard !isTargetFocused, !isTargetInputDirty else { return }
+                targetText = String(value)
+                isTargetInputDirty = false
+            }
+            .onChange(of: portaly.isPro) { _, _ in
+                healthCoordinator.refreshEntitlement()
+                guard !isTargetFocused, !isTargetInputDirty else { return }
+                targetText = String(healthCoordinator.target)
+            }
+            .alert(healthAlertTitle, isPresented: $showHealthPermissionAlert) {
+                Button("確定", role: .cancel) { }
+            } message: {
+                Text(healthPermissionMessage)
+            }
+            .alert(supportAlertTitle, isPresented: $showSupportAlert) {
+                Button("確定", role: .cancel) { }
+            } message: {
+                Text(supportAlertMessage)
+            }
+        }
+    }
+
+    private func scrollToRequestedSection(_ proxy: ScrollViewProxy) {
+        guard !didInitialScroll,
+              initialScrollTarget == .walkingHealth else { return }
+        didInitialScroll = true
+        DispatchQueue.main.async {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                proxy.scrollTo(SectionID.walkingHealth, anchor: .top)
+            }
+        }
+    }
+
+    private var healthWriteSettingsSection: some View {
+        Section {
+            stepInputRow(
+                "每次累計寫入",
+                text: $batchSizeText,
+                isFocused: $isBatchSizeFocused,
+                onCommit: commitBatchSizeInput
+            )
+            .disabled(!canEditStepSettings)
+            stepInputRow(
+                "預計寫入總數",
+                text: targetInputBinding,
+                isFocused: $isTargetFocused,
+                onCommit: commitTargetInput
+            )
+            .disabled(!canEditStepSettings)
+        } header: {
+            Text("寫入設定")
+        } footer: {
+            Text(
+                canEditStepSettings
+                    ? "Pro 可自訂每日預計寫入總數；設定會保留在本機。"
+                    : "Free 每次固定累計寫入 1000 步、每日最多 10000 步；升級 Pro 後會恢復先前保存的設定。"
+            )
         }
     }
 
@@ -241,6 +377,68 @@ struct CompatibilityCheckView: View {
         )
     }
 
+    private var canEditStepSettings: Bool {
+        portaly.isPro
+    }
+
+    private var directHealthStepCount: Int? {
+        guard let value = Int(directHealthStepsText), (1...1_000_000).contains(value) else { return nil }
+        return value
+    }
+
+    private func writeDirectHealthSteps() {
+        let portaly = PortalyCheckoutService.shared
+        guard portaly.isPro else {
+            healthAlertTitle = PortalyCheckoutService.proFeatureAlertTitle
+            healthPermissionMessage = PortalyCheckoutService.proFeatureAlertMessage
+            showHealthPermissionAlert = true
+            return
+        }
+
+        guard let steps = directHealthStepCount else { return }
+        isWritingDirectSteps = true
+        Task { @MainActor in
+            guard await portaly.refreshProEntitlementIfNeeded() else {
+                isWritingDirectSteps = false
+                healthAlertTitle = PortalyCheckoutService.proFeatureAlertTitle
+                healthPermissionMessage = PortalyCheckoutService.proFeatureAlertMessage
+                showHealthPermissionAlert = true
+                return
+            }
+            performDirectHealthWrite(steps)
+        }
+    }
+
+    private func performDirectHealthWrite(_ steps: Int) {
+        HealthStepSyncManager.shared.requestAuthorizationIfNeeded { granted in
+            guard granted else {
+                DispatchQueue.main.async {
+                    isWritingDirectSteps = false
+                    healthAlertTitle = "無法寫入健康"
+                    healthPermissionMessage = "需要允許 UFOGeo 寫入步數。請到系統設定或健康 App 開啟步數權限。"
+                    showHealthPermissionAlert = true
+                }
+                return
+            }
+
+            HealthStepSyncManager.shared.writeSteps(steps) { result in
+                DispatchQueue.main.async {
+                    isWritingDirectSteps = false
+                    switch result {
+                    case .success:
+                        directHealthStepsText = ""
+                        healthAlertTitle = "寫入完成"
+                        healthPermissionMessage = "已將 \(steps) 步寫入 Apple 健康。"
+                    case .failure(let error):
+                        healthAlertTitle = "寫入失敗"
+                        healthPermissionMessage = error.localizedDescription
+                    }
+                    showHealthPermissionAlert = true
+                }
+            }
+        }
+    }
+
     private func compactStatusRow(_ title: String, value: String, color: Color) -> some View {
         HStack {
             Text(title)
@@ -265,6 +463,123 @@ struct CompatibilityCheckView: View {
         case .reachable: return .green
         case .failed: return .red
         }
+    }
+
+    private func stepInputRow(
+        _ title: String,
+        text: Binding<String>,
+        isFocused: FocusState<Bool>.Binding,
+        onCommit: @escaping () -> Void
+    ) -> some View {
+        HStack {
+            Text(title)
+            Spacer()
+            TextField("步數", text: text)
+                .multilineTextAlignment(.trailing)
+                .monospacedDigit()
+                .frame(width: 110)
+                .focused(isFocused)
+                .numericInputStyle()
+                .onSubmit(onCommit)
+                .onChange(of: isFocused.wrappedValue) { _, focused in
+                    if !focused { onCommit() }
+                }
+            Text("步").foregroundStyle(.secondary)
+        }
+    }
+
+    private func commitBatchSizeInput() {
+        guard canEditStepSettings else {
+            batchSizeText = String(healthCoordinator.batchSize)
+            return
+        }
+
+        let value = max(Int(batchSizeText) ?? healthCoordinator.batchSize, 1)
+        healthCoordinator.updateBatchSize(value)
+        batchSizeText = String(healthCoordinator.batchSize)
+    }
+
+    private var targetInputBinding: Binding<String> {
+        Binding(
+            get: { targetText },
+            set: { value in
+                if value != targetText {
+                    isTargetInputDirty = true
+                }
+                targetText = value
+            }
+        )
+    }
+
+    private func commitTargetInput() {
+        guard canEditStepSettings else {
+            targetText = String(healthCoordinator.target)
+            isTargetInputDirty = false
+            return
+        }
+
+        guard isTargetInputDirty else {
+            targetText = String(healthCoordinator.target)
+            return
+        }
+
+        guard let enteredTarget = Int(targetText), enteredTarget >= 0 else {
+            targetText = String(healthCoordinator.target)
+            isTargetInputDirty = false
+            return
+        }
+
+        let target = max(enteredTarget, 1)
+        healthCoordinator.updateTarget(target)
+        targetText = String(healthCoordinator.target)
+        isTargetInputDirty = false
+    }
+
+    private var displayedRemainingSteps: Int {
+        guard isTargetFocused,
+              isTargetInputDirty,
+              let previewTarget = Int(targetText),
+              previewTarget > 0 else {
+            return healthCoordinator.remainingSteps
+        }
+        return previewTarget
+    }
+
+    private func showProFeatureAlert() {
+        healthAlertTitle = PortalyCheckoutService.proFeatureAlertTitle
+        healthPermissionMessage = PortalyCheckoutService.proFeatureAlertMessage
+        showHealthPermissionAlert = true
+    }
+
+    private var walkingRateBinding: Binding<Int> {
+        Binding(
+            get: { healthCoordinator.stepsPerSecond },
+            set: { value in
+                guard portaly.isPro else {
+                    showProFeatureAlert()
+                    return
+                }
+                healthCoordinator.updateRate(value)
+            }
+        )
+    }
+
+    private var healthWalkingBinding: Binding<Bool> {
+        Binding(
+            get: { healthCoordinator.isEnabled },
+            set: { enabled in
+                guard enabled else {
+                    healthCoordinator.setEnabled(false)
+                    return
+                }
+                healthCoordinator.setEnabled(true) { granted in
+                    guard !granted else { return }
+                    healthAlertTitle = "健康權限"
+                    healthPermissionMessage = "需要允許 UFOGeo 寫入步數。請到系統設定或健康 App 開啟步數權限。"
+                    showHealthPermissionAlert = true
+                }
+            }
+        )
     }
 
     private var connectionOverview: some View {
@@ -340,8 +655,8 @@ struct CompatibilityCheckView: View {
 
     private var locationAuthorizationText: String {
         switch CLLocationManager().authorizationStatus {
-        case .authorizedAlways: return "永遠允許"
-        case .authorizedWhenInUse: return "使用 App 期間"
+        case .authorizedAlways: return "已就緒（永遠）"
+        case .authorizedWhenInUse: return "需改為「永遠」"
         case .denied: return "已拒絕"
         case .restricted: return "受限制"
         case .notDetermined: return "尚未詢問"

@@ -13,7 +13,7 @@ final class UpdateCheckManager: ObservableObject {
     }
 
     private let repositoryOwner = "Leoohyeah"
-    private let repositoryName = "UFOGeo"
+    private let repositoryName = "UFOGeo-Health"
     private let checkInterval: TimeInterval = 86400 // 24小時檢查一次
     private var cancellables = Set<AnyCancellable>()
 

@@ -3,11 +3,12 @@ import UIKit
 
 extension Notification.Name {
     static let backgroundLocationHeartbeat = Notification.Name(
-        "com.ufogo.background-location-heartbeat"
+        "com.ufogeo.background-location-heartbeat"
     )
 }
 
-final class BackgroundLocationManager: NSObject, CLLocationManagerDelegate {
+@MainActor
+final class BackgroundLocationManager: NSObject, @preconcurrency CLLocationManagerDelegate {
     enum Activity: Hashable {
         case continuousLocation
         case route
@@ -53,22 +54,31 @@ final class BackgroundLocationManager: NSObject, CLLocationManagerDelegate {
     @objc private func handleAppWillEnterForeground() {
         // 回前景後恢復高精度
         locationManager.desiredAccuracy = kCLLocationAccuracyBest
+        // 使用者可在系統設定重新開啟定位；保留中的活動應在回到 App
+        // 時重新嘗試啟動，不讓先前的拒絕永久卡住背景定位。
+        if !activities.isEmpty, !isRunning {
+            start()
+        }
     }
 
     func start() {
         guard !isRunning else { return }
-        isRunning = true
         switch locationManager.authorizationStatus {
         case .authorizedAlways:
+            isRunning = true
             backgroundActivitySession = CLBackgroundActivitySession()
             locationManager.startUpdatingLocation()
         case .authorizedWhenInUse:
+            isRunning = true
             locationManager.requestAlwaysAuthorization()
         case .notDetermined:
+            isRunning = true
             // iOS expects the permission flow to progress from When In Use to Always.
             locationManager.requestWhenInUseAuthorization()
         default:
-            break
+            // Keep activities so a permission change can be retried on the
+            // next foreground transition, but do not report the service running.
+            isRunning = false
         }
     }
 
@@ -92,7 +102,17 @@ final class BackgroundLocationManager: NSObject, CLLocationManagerDelegate {
     }
 
     func requestStart(for activity: Activity) {
+        if activity == .route
+            && !PortalyCheckoutService.shared.canUseBackgroundRouteSimulation {
+            activities.remove(.route)
+            if !shouldRunLocationService {
+                stop()
+            }
+            return
+        }
+
         let inserted = activities.insert(activity).inserted
+
         if inserted, shouldRunLocationService {
             start()
         }
@@ -107,6 +127,12 @@ final class BackgroundLocationManager: NSObject, CLLocationManagerDelegate {
 
     private var shouldRunLocationService: Bool {
         !activities.isEmpty
+    }
+
+    var canDeliverBackgroundHeartbeats: Bool {
+        isRunning
+            && locationManager.authorizationStatus == .authorizedAlways
+            && backgroundActivitySession != nil
     }
 
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {

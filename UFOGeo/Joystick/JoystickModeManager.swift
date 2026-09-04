@@ -6,10 +6,10 @@ import UserNotifications
 
 extension Notification.Name {
     static let simulationRoutesDidChange = Notification.Name(
-        "com.ufogo.simulation-routes-did-change"
+        "com.ufogeo.simulation-routes-did-change"
     )
     static let routeSimulationDidExpire = Notification.Name(
-        "com.ufogo.route-simulation-did-expire"
+        "com.ufogeo.route-simulation-did-expire"
     )
 }
 
@@ -128,7 +128,11 @@ class JoystickModeManager: ObservableObject {
     @Published var isSimulating: Bool = false
     @Published var isPaused: Bool = false
     @Published private(set) var isRouteCompleted: Bool = false
-    @Published var simulationSpeed: Double = 50
+    @Published var simulationSpeed: Double = 50 {
+        didSet {
+            healthCoordinator.updateRouteSpeed(speedKilometersPerHour: simulationSpeed)
+        }
+    }
     @Published var simulationStartIndex: Int = 0
     @Published var currentRouteIndex: Int = 0
     @Published var simulationProgress: Double = 0.0
@@ -158,6 +162,7 @@ class JoystickModeManager: ObservableObject {
     private var routeState: RouteSimulationState?
     private var activeCompletionMode: PathCompletionMode?
     private var lastSimulationUpdateDate: Date?
+    private let healthCoordinator = HealthWalkingCoordinator.shared
     
     init(defaults: UserDefaults = .standard) {
         routeDefaults = defaults
@@ -244,6 +249,18 @@ class JoystickModeManager: ObservableObject {
     var favoriteRoutes: [SimulationRoute] {
         routes.filter { $0.isFavorite }
     }
+
+    func reorderFavoriteRoutes(from source: IndexSet, to destination: Int) {
+        var reorderedFavorites = favoriteRoutes
+        reorderedFavorites.move(fromOffsets: source, toOffset: destination)
+
+        var favoriteIndex = 0
+        for index in routes.indices where routes[index].isFavorite {
+            routes[index] = reorderedFavorites[favoriteIndex]
+            favoriteIndex += 1
+        }
+        persistRoutes()
+    }
     
     
     func startPathSimulation(route: SimulationRoute, speed: Double, startIndex: Int = 0) {
@@ -271,6 +288,8 @@ class JoystickModeManager: ObservableObject {
         routeState = engine.initialState()
         activeCompletionMode = completionMode
         lastSimulationUpdateDate = Date()
+        healthCoordinator.startRouteSimulation(speedKilometersPerHour: speed)
+        
         startSimulationTimer(speed: speed)
     }
     
@@ -285,6 +304,7 @@ class JoystickModeManager: ObservableObject {
         routeState = nil
         activeCompletionMode = nil
         selectedRoute = nil
+        healthCoordinator.stopRoute()
     }
 
     /// 停止路線移動，但保留路線與當下座標供背景心跳固定定位。
@@ -295,6 +315,7 @@ class JoystickModeManager: ObservableObject {
         simulationTimer?.invalidate()
         simulationTimer = nil
         lastSimulationUpdateDate = nil
+        healthCoordinator.stopRoute()
     }
     
     func pausePathSimulation() {
@@ -304,6 +325,7 @@ class JoystickModeManager: ObservableObject {
         simulationTimer?.invalidate()
         simulationTimer = nil
         lastSimulationUpdateDate = nil
+        healthCoordinator.pauseRoute()
     }
     
     func resumePathSimulation(speed: Double) {
@@ -312,6 +334,7 @@ class JoystickModeManager: ObservableObject {
             isSimulating = true
             isPaused = false
             lastSimulationUpdateDate = Date()
+            healthCoordinator.resumeRoute(speedKilometersPerHour: speed)
             startSimulationTimer()
         }
     }
@@ -363,6 +386,8 @@ class JoystickModeManager: ObservableObject {
     func advanceForBackgroundHeartbeat(at date: Date = Date()) {
         if isSimulating {
             updateSimulationProgress(at: date)
+        } else {
+            healthCoordinator.advanceForBackgroundHeartbeat(at: date)
         }
     }
 
@@ -377,6 +402,8 @@ class JoystickModeManager: ObservableObject {
         let elapsed = min(max(date.timeIntervalSince(previousSimulationUpdateDate), 0), 86_400)
         self.lastSimulationUpdateDate = date
         guard elapsed > 0 else { return }
+
+        healthCoordinator.advanceForBackgroundHeartbeat(at: date)
 
         guard let routeEngine, let routeState else {
             stopPathSimulation()
@@ -427,11 +454,21 @@ class JoystickModeManager: ObservableObject {
         content.body = descriptor.body
         content.sound = .default
         let request = UNNotificationRequest(
-            identifier: "com.ufogo.route-completed-\(UUID().uuidString)",
+            identifier: "com.ufogeo.route-completed-\(UUID().uuidString)",
             content: content,
             trigger: nil
         )
         UNUserNotificationCenter.current().add(request) { _ in }
+    }
+
+    func startStandaloneWalkingSession() {
+        // Fixed-location walking lasts for the whole simulation session; the
+        // joystick only changes the simulated coordinate and movement speed.
+        healthCoordinator.prepareFixedSimulation()
+    }
+
+    func stopStandaloneWalkingSession() {
+        healthCoordinator.stopFixedSimulation()
     }
 
     private func persistRoutes() {

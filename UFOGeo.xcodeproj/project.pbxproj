@@ -24,6 +24,7 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		C040D5E23034AA5100D77540 /* HealthKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = HealthKit.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS26.2.sdk/System/Library/Frameworks/HealthKit.framework; sourceTree = DEVELOPER_DIR; };
 		DC6F1D372D94EADD0071B2B6 /* UFOGeo.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = UFOGeo.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		DC6F1D482D94EADF0071B2B6 /* UFOGeoTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = UFOGeoTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		DC6F1D522D94EADF0071B2B6 /* UFOGeoUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = UFOGeoUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -109,6 +110,7 @@
 		DC6F1D752D94EB620071B2B6 /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
+				C040D5E23034AA5100D77540 /* HealthKit.framework */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -197,6 +199,11 @@
 					DC6F1D362D94EADD0071B2B6 = {
 						CreatedOnToolsVersion = 16.2;
 						LastSwiftMigration = 1620;
+						SystemCapabilities = {
+							com.apple.HealthKit = {
+								enabled = 1;
+							};
+						};
 					};
 					DC6F1D472D94EADF0071B2B6 = {
 						CreatedOnToolsVersion = 16.2;
@@ -427,10 +434,11 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEAD_CODE_STRIPPING = YES;
-				DEVELOPMENT_TEAM = DGF4PA822C;
+				DEVELOPMENT_TEAM = 7KBZ7TCFCS;
 				ENABLE_DEBUG_DYLIB = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
+				FIREBASE_WEB_API_KEY = AIzaSyCVvZ2lwWLnjSll29BMPYYUTFhNQIU4LS0;
 				FRAMEWORK_SEARCH_PATHS = "$(inherited)";
 				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = (
@@ -441,6 +449,8 @@
 				INFOPLIST_KEY_CFBundleDisplayName = UFOGeo;
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
 				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
+				INFOPLIST_KEY_NSHealthShareUsageDescription = "允許讀取健康資料狀態，以便顯示模擬步數同步情況。";
+				INFOPLIST_KEY_NSHealthUpdateUsageDescription = "允許將路徑模擬產生的步數寫入健康。";
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "UFOGeo 需要透過區域網路或 VPN 與已配對的 iPhone 通訊，以設定模擬定位。";
 				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "允許 UFOGeo 永遠取用位置，才能在背景持續維持定位模擬與連線。";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "UFOGeo 需要取得你目前的位置，作為搖桿移動與定位模擬的起始座標。";
@@ -464,6 +474,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.1;
 				MARKETING_VERSION = 1.0.0;
+				PORTALY_BACKEND_URL = "https://ufogeo-adac7.web.app";
 				PRODUCT_BUNDLE_IDENTIFIER = com.ufogeo.app;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
@@ -492,9 +503,10 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEAD_CODE_STRIPPING = YES;
-				DEVELOPMENT_TEAM = DGF4PA822C;
+				DEVELOPMENT_TEAM = 7KBZ7TCFCS;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
+				FIREBASE_WEB_API_KEY = AIzaSyCVvZ2lwWLnjSll29BMPYYUTFhNQIU4LS0;
 				FRAMEWORK_SEARCH_PATHS = "$(inherited)";
 				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = (
@@ -505,6 +517,8 @@
 				INFOPLIST_KEY_CFBundleDisplayName = UFOGeo;
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
 				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
+				INFOPLIST_KEY_NSHealthShareUsageDescription = "允許讀取健康資料狀態，以便顯示模擬步數同步情況。";
+				INFOPLIST_KEY_NSHealthUpdateUsageDescription = "允許將路徑模擬產生的步數寫入健康。";
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "UFOGeo 需要透過區域網路或 VPN 與已配對的 iPhone 通訊，以設定模擬定位。";
 				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "允許 UFOGeo 永遠取用位置，才能在背景持續維持定位模擬與連線。";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "UFOGeo 需要取得你目前的位置，作為搖桿移動與定位模擬的起始座標。";
@@ -528,6 +542,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.1;
 				MARKETING_VERSION = 1.0.0;
+				PORTALY_BACKEND_URL = "https://ufogeo-adac7.web.app";
 				PRODUCT_BUNDLE_IDENTIFIER = com.ufogeo.app;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
@@ -563,7 +578,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.1;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.ufogo.app.tests;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ufogeo.app.tests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = auto;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
@@ -596,7 +611,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.1;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.ufogo.app.tests;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ufogeo.app.tests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = auto;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
@@ -620,7 +635,7 @@
 				IPHONEOS_DEPLOYMENT_TARGET = 17.4;
 				MACOSX_DEPLOYMENT_TARGET = 15.1;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.ufogo.app.uitests;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ufogeo.app.uitests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = auto;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
@@ -643,7 +658,7 @@
 				IPHONEOS_DEPLOYMENT_TARGET = 17.4;
 				MACOSX_DEPLOYMENT_TARGET = 15.1;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.ufogo.app.uitests;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ufogeo.app.uitests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = auto;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";

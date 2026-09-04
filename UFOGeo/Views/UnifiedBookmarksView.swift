@@ -135,17 +135,20 @@ struct UnifiedBookmarksView: View {
     @State private var sortOrder: SortOrder = .custom
 
     let onSelectLocation: ((LocationBookmark) -> Void)?
+    let onSelectHistory: ((CLLocationCoordinate2D) -> Void)?
     let onLocationBookmarksChanged: (([LocationBookmark]) -> Void)?
 
     init(
         locationBookmarks: [LocationBookmark]? = nil,
         onSelectLocation: ((LocationBookmark) -> Void)? = nil,
+        onSelectHistory: ((CLLocationCoordinate2D) -> Void)? = nil,
         onLocationBookmarksChanged: (([LocationBookmark]) -> Void)? = nil
     ) {
         let stored = LocationBookmarkStore.load()
         _locationBookmarks = State(initialValue: locationBookmarks ?? stored)
         _historyRecords = State(initialValue: LocationHistoryStore.load())
         self.onSelectLocation = onSelectLocation
+        self.onSelectHistory = onSelectHistory
         self.onLocationBookmarksChanged = onLocationBookmarksChanged
     }
 
@@ -177,6 +180,7 @@ struct UnifiedBookmarksView: View {
                             historyRecords.removeAll()
                             LocationHistoryStore.save(historyRecords)
                         }
+                        .disabled(sharedMapState.isSimulationInteractionLocked)
                     }
                 }
                 if kind == .location || kind == .route {
@@ -213,6 +217,10 @@ struct UnifiedBookmarksView: View {
             }
             .sheet(item: $editingRoute) { route in
                 RouteBookmarkEditorView(route: route) { updated in
+                    guard !sharedMapState.isSimulationInteractionLocked else {
+                        editingRoute = nil
+                        return
+                    }
                     routeManager.saveRoute(updated)
                     routeManager.reloadRoutes()
                 }
@@ -235,10 +243,11 @@ struct UnifiedBookmarksView: View {
                 Section("最近紀錄") {
                     ForEach(historyRecords) { record in
                         Button {
-                            sharedMapState.selectedCoordinate = record.coordinate
-                            sharedMapState.mapPosition = .region(
-                                SharedLocationMapState.defaultSimulationRegion(centeredAt: record.coordinate)
+                            selectCoordinate(
+                                record.coordinate,
+                                updatesSelection: !sharedMapState.isSimulationActive
                             )
+                            onSelectHistory?(record.coordinate)
                             dismiss()
                         } label: {
                             VStack(alignment: .leading, spacing: 4) {
@@ -258,6 +267,7 @@ struct UnifiedBookmarksView: View {
                                     .foregroundStyle(.secondary)
                             }
                         }
+                        .disabled(sharedMapState.isSimulationTransitioning)
                         .swipeActions(edge: .leading, allowsFullSwipe: false) {
                             Button { copyHistory(record) } label: {
                                 Label("複製", systemImage: "doc.on.doc")
@@ -267,9 +277,14 @@ struct UnifiedBookmarksView: View {
                                 Label("收藏", systemImage: "bookmark.fill")
                             }
                             .tint(.orange)
+                            .disabled(sharedMapState.isSimulationInteractionLocked)
                         }
                     }
-                    .onDelete(perform: deleteHistory)
+                    .onDelete(
+                        perform: sharedMapState.isSimulationInteractionLocked
+                            ? nil
+                            : deleteHistory
+                    )
                 }
             }
         }
@@ -283,7 +298,7 @@ struct UnifiedBookmarksView: View {
                 Section("定位收藏") {
                     ForEach(sortedLocationBookmarks) { bookmark in
                         Button {
-                            sharedMapState.selectedCoordinate = bookmark.coordinate
+                            selectCoordinate(bookmark.coordinate)
                             onSelectLocation?(bookmark)
                             dismiss()
                         } label: {
@@ -295,6 +310,7 @@ struct UnifiedBookmarksView: View {
                                     .foregroundStyle(.secondary)
                             }
                         }
+                        .disabled(sharedMapState.isSimulationTransitioning)
                         .swipeActions(edge: .leading, allowsFullSwipe: false) {
                             Button {
                                 editingLocationBookmark = bookmark
@@ -302,6 +318,7 @@ struct UnifiedBookmarksView: View {
                                 Label("編輯", systemImage: "pencil")
                             }
                             .tint(.orange)
+                            .disabled(sharedMapState.isSimulationInteractionLocked)
                             Button {
                                 copyLocation(bookmark)
                             } label: {
@@ -310,8 +327,18 @@ struct UnifiedBookmarksView: View {
                             .tint(.accentColor)
                         }
                     }
-                    .onDelete(perform: sortOrder == .custom ? deleteLocations : nil)
-                    .onMove(perform: sortOrder == .custom ? moveLocations : nil)
+                    .onDelete(
+                        perform: sortOrder == .custom
+                            && !sharedMapState.isSimulationInteractionLocked
+                            ? deleteLocations
+                            : nil
+                    )
+                    .onMove(
+                        perform: sortOrder == .custom
+                            && !sharedMapState.isSimulationInteractionLocked
+                            ? moveLocations
+                            : nil
+                    )
                 }
             }
         }
@@ -339,20 +366,25 @@ struct UnifiedBookmarksView: View {
                                     .foregroundStyle(.secondary)
                             }
                         }
+                        .disabled(sharedMapState.isSimulationInteractionLocked)
                         .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                             Button(role: .destructive) {
+                                guard !sharedMapState.isSimulationInteractionLocked else { return }
                                 routeManager.deleteRoute(route)
                             } label: {
                                 Label("刪除", systemImage: "trash")
                             }
+                            .disabled(sharedMapState.isSimulationInteractionLocked)
                         }
                         .swipeActions(edge: .leading, allowsFullSwipe: false) {
                             Button {
+                                guard !sharedMapState.isSimulationInteractionLocked else { return }
                                 editingRoute = route
                             } label: {
                                 Label("編輯", systemImage: "pencil")
                             }
                             .tint(.orange)
+                            .disabled(sharedMapState.isSimulationInteractionLocked)
                             Button {
                                 copyRoute(route)
                             } label: {
@@ -361,7 +393,12 @@ struct UnifiedBookmarksView: View {
                             .tint(.accentColor)
                         }
                     }
-                    .onMove(perform: sortOrder == .custom ? moveRoutes : nil)
+                    .onMove(
+                        perform: sortOrder == .custom
+                            && !sharedMapState.isSimulationInteractionLocked
+                            ? moveRoutes
+                            : nil
+                    )
                 }
             }
         }
@@ -383,26 +420,48 @@ struct UnifiedBookmarksView: View {
         }
     }
 
+    private func selectCoordinate(
+        _ coordinate: CLLocationCoordinate2D,
+        updatesSelection: Bool = true
+    ) {
+        if updatesSelection {
+            sharedMapState.selectedCoordinate = coordinate
+        }
+        sharedMapState.mapPosition = .region(
+            SharedLocationMapState.defaultSimulationRegion(centeredAt: coordinate)
+        )
+        sharedMapState.nativeMapCenterRequest = NativeMapCenterRequest(
+            coordinate: coordinate,
+            preserveZoom: false
+        )
+        SharedNativeMapStore.shared.center(
+            at: coordinate,
+            preserveZoom: false
+        )
+    }
+
     private func moveLocations(from source: IndexSet, to destination: Int) {
+        guard !sharedMapState.isSimulationInteractionLocked else { return }
         locationBookmarks.move(fromOffsets: source, toOffset: destination)
         LocationBookmarkStore.save(locationBookmarks)
         onLocationBookmarksChanged?(locationBookmarks)
     }
 
     private func moveRoutes(from source: IndexSet, to destination: Int) {
-        var routes = routeManager.favoriteRoutes
-        routes.move(fromOffsets: source, toOffset: destination)
-        for route in routes { routeManager.saveRoute(route) }
+        guard !sharedMapState.isSimulationInteractionLocked else { return }
+        routeManager.reorderFavoriteRoutes(from: source, to: destination)
         routeManager.reloadRoutes()
     }
 
     private func deleteLocations(at offsets: IndexSet) {
+        guard !sharedMapState.isSimulationInteractionLocked else { return }
         locationBookmarks.remove(atOffsets: offsets)
         LocationBookmarkStore.save(locationBookmarks)
         onLocationBookmarksChanged?(locationBookmarks)
     }
 
     private func saveEditedLocation(_ bookmark: LocationBookmark) {
+        guard !sharedMapState.isSimulationInteractionLocked else { return }
         guard let index = locationBookmarks.firstIndex(where: { $0.id == bookmark.id }) else {
             return
         }
@@ -417,20 +476,18 @@ struct UnifiedBookmarksView: View {
     }
 
     private func copyRoute(_ route: SimulationRoute) {
-        UIPasteboard.general.string = route.points.enumerated().map { index, point in
-            "#\(index + 1) \(CoordinateDisplayFormatter.string(point.coordinate))"
+        UIPasteboard.general.string = route.points.map { point in
+            CoordinateDisplayFormatter.string(point.coordinate)
         }.joined(separator: "\n")
         copiedMessage = "已複製「\(route.name)」的 \(route.points.count) 個座標"
     }
 
     private func applyRoute(_ route: SimulationRoute) {
+        guard !sharedMapState.isSimulationInteractionLocked else { return }
         sharedMapState.requestedRouteID = route.id
         sharedMapState.requestedTabID = AppFeature.pathSimulation.id
         if let coordinate = route.points.first?.coordinate {
-            sharedMapState.selectedCoordinate = coordinate
-            sharedMapState.mapPosition = .region(
-                SharedLocationMapState.defaultSimulationRegion(centeredAt: coordinate)
-            )
+            selectCoordinate(coordinate)
         }
         dismiss()
     }
@@ -441,6 +498,7 @@ struct UnifiedBookmarksView: View {
     }
 
     private func favoriteHistory(_ record: LocationHistoryRecord) {
+        guard !sharedMapState.isSimulationInteractionLocked else { return }
         guard !locationBookmarks.contains(where: {
             abs($0.latitude - record.latitude) < 0.000_001 && abs($0.longitude - record.longitude) < 0.000_001
         }) else {
@@ -458,6 +516,7 @@ struct UnifiedBookmarksView: View {
     }
 
     private func deleteHistory(at offsets: IndexSet) {
+        guard !sharedMapState.isSimulationInteractionLocked else { return }
         historyRecords.remove(atOffsets: offsets)
         LocationHistoryStore.save(historyRecords)
     }

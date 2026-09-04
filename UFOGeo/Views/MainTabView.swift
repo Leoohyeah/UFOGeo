@@ -9,12 +9,15 @@ struct MainTabView: View {
     @StateObject private var sharedLocationMapState = SharedLocationMapState()
     @StateObject private var startupLocationProvider = CurrentLocationProvider()
     @StateObject private var backgroundSimulationManager = BackgroundSimulationManager.shared
+    @StateObject private var portaly = PortalyCheckoutService.shared
+    @StateObject private var auth = FirebaseAuthService.shared
+    @StateObject private var healthCoordinator = HealthWalkingCoordinator.shared
     @AppStorage(UserDefaults.Keys.primaryTabSelection) private var selection: String = AppFeature.home.id
-    @State private var didSetInitialHome = false
     @State private var didApplyStartupLocation = false
     @State private var showStopSimulationPrompt = false
     @State private var showResetWarning = false
     @State private var resetWarningMessage = ""
+    @State private var membershipRefreshTask: Task<Void, Never>?
 
     var body: some View {
         ZStack {
@@ -27,10 +30,6 @@ struct MainTabView: View {
             .environmentObject(sharedLocationMapState)
             .onAppear {
                 ensureSelectionIsValid()
-                if !didSetInitialHome {
-                    selection = AppFeature.home.id
-                    didSetInitialHome = true
-                }
                 sharedLocationMapState.activeTabID = selection
                 sharedLocationMapState.testTunnel()
                 handleAppBecameActive()
@@ -42,19 +41,45 @@ struct MainTabView: View {
                 switch phase {
                 case .active:
                     handleAppBecameActive()
+                    refreshMembershipEntitlement()
                 case .background:
+                    stopMembershipRefreshLoop()
                     recordNoSimulationBackgroundIfNeeded()
                     stopBackgroundLocationIfSimulationIsInactive()
                 case .inactive:
+                    refreshProEntitlementBeforeBackgroundIfNeeded()
                     recordNoSimulationBackgroundIfNeeded()
                 @unknown default:
                     break
                 }
             }
+            .onDisappear {
+                stopMembershipRefreshLoop()
+            }
+            .task(id: auth.session?.uid) {
+                stopMembershipRefreshLoop()
+                guard let expectedUID = auth.session?.uid,
+                      scenePhase == .active else { return }
+                await synchronizeMembershipEntitlement(forceRefresh: true)
+                guard auth.session?.uid == expectedUID else { return }
+                startMembershipRefreshLoopIfNeeded()
+            }
+            .onChange(of: portaly.isPro) { _, _ in
+                startMembershipRefreshLoopIfNeeded()
+            }
+            .onChange(of: sharedLocationMapState.isMovementActive) { _, _ in
+                startMembershipRefreshLoopIfNeeded()
+            }
+            .onChange(of: healthCoordinator.isGenerating) { _, _ in
+                startMembershipRefreshLoopIfNeeded()
+            }
             .onReceive(
                 NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)
             ) { _ in
-                backgroundSimulationManager.notifySimulationActiveIfNeeded()
+                backgroundSimulationManager.notifySimulationActiveIfNeeded(
+                    backgroundLocationAvailable: BackgroundLocationManager.shared
+                        .canDeliverBackgroundHeartbeats
+                )
             }
             .onReceive(backgroundSimulationManager.$currentMode) { mode in
                 guard scenePhase == .active else { return }
@@ -68,7 +93,7 @@ struct MainTabView: View {
                 sharedLocationMapState.captureLaunchCoordinateIfNeeded(coordinate)
                 guard
                       !didApplyStartupLocation,
-                      !sharedLocationMapState.isSimulationActive else { return }
+                      !sharedLocationMapState.isSimulationInteractionLocked else { return }
                 didApplyStartupLocation = true
                 sharedLocationMapState.selectedCoordinate = coordinate
                 sharedLocationMapState.mapPosition = .region(
@@ -107,7 +132,7 @@ struct MainTabView: View {
             } message: {
                 Text(stopSimulationPromptMessage)
             }
-            .alert("背景超時重置未完成", isPresented: $showResetWarning) {
+            .alert("閒置背景重置未完成", isPresented: $showResetWarning) {
                 Button("知道了", role: .cancel) { }
             } message: {
                 Text(resetWarningMessage)
@@ -142,7 +167,7 @@ struct MainTabView: View {
     private var activeSimulationInfo: (pageTitle: String, tabID: String)? {
         switch backgroundSimulationManager.currentMode {
         case .fixedLocation:
-            return ("定位頁", AppFeature.home.id)
+            return ("定位/步數頁", AppFeature.home.id)
         case .route:
             return ("路線頁", AppFeature.pathSimulation.id)
         case nil:
@@ -151,9 +176,12 @@ struct MainTabView: View {
     }
 
     private var stopSimulationPromptMessage: String {
+        if sharedLocationMapState.isSimulationTransitioning {
+            return "模擬正在啟動或停止，請稍候完成後再切換分頁。"
+        }
         switch backgroundSimulationManager.currentMode {
         case .fixedLocation:
-            return "目前仍在執行定位模擬。請先到定位頁按下停止，再切換分頁。"
+            return "目前仍在執行定位/步數模擬。請先到定位頁按下停止，再切換分頁。"
         case .route:
             return "目前仍在執行路線模擬。請先到路線頁按下停止，再切換分頁。"
         case nil:
@@ -183,6 +211,7 @@ struct MainTabView: View {
     }
 
     private func handleAppBecameActive() {
+        guard !sharedLocationMapState.isSimulationTransitioning else { return }
         if shouldApplyNoSimulationColdStartReset() {
             applyNoSimulationColdStartReset()
             return
@@ -195,6 +224,81 @@ struct MainTabView: View {
         switchToActiveSimulationTabIfNeeded()
     }
 
+    private func refreshMembershipEntitlement() {
+        guard auth.isSignedIn else {
+            stopMembershipRefreshLoop()
+            return
+        }
+        Task {
+            await synchronizeMembershipEntitlement(forceRefresh: false)
+            startMembershipRefreshLoopIfNeeded()
+        }
+    }
+
+    private func synchronizeMembershipEntitlement(forceRefresh: Bool) async {
+        // The service serializes portal reconciliation and the single forced
+        // refresh required after returning from either hosted flow.
+        try? await portaly.synchronizeOnForeground(forceRefresh: forceRefresh)
+    }
+
+    private var isForegroundProFeatureActive: Bool {
+        sharedLocationMapState.isMovementActive || healthCoordinator.isGenerating
+    }
+
+    nonisolated static func shouldRunPeriodicMembershipRefresh(
+        isSignedIn: Bool,
+        isSceneActive: Bool,
+        isPro: Bool,
+        isMovementActive: Bool,
+        isHealthGenerating: Bool
+    ) -> Bool {
+        isSignedIn && isSceneActive && isPro &&
+            (isMovementActive || isHealthGenerating)
+    }
+
+    private func startMembershipRefreshLoopIfNeeded() {
+        stopMembershipRefreshLoop()
+        guard Self.shouldRunPeriodicMembershipRefresh(
+            isSignedIn: auth.isSignedIn,
+            isSceneActive: scenePhase == .active,
+            isPro: portaly.isPro,
+            isMovementActive: sharedLocationMapState.isMovementActive,
+            isHealthGenerating: healthCoordinator.isGenerating
+        ) else { return }
+        membershipRefreshTask = Task { @MainActor in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(
+                        for: .seconds(max(portaly.proEntitlementRefreshDelay, 1))
+                    )
+                } catch {
+                    return
+                }
+                guard auth.isSignedIn,
+                      scenePhase == .active,
+                      portaly.isPro,
+                      isForegroundProFeatureActive else { return }
+                _ = await portaly.refreshProEntitlementIfNeeded()
+            }
+        }
+    }
+
+    private func refreshProEntitlementBeforeBackgroundIfNeeded() {
+        guard auth.isSignedIn,
+              portaly.isPro,
+              backgroundSimulationManager.currentMode == .route ||
+                sharedLocationMapState.isMovementActive ||
+                healthCoordinator.isGenerating else { return }
+        Task {
+            _ = await portaly.refreshProEntitlementIfNeeded()
+        }
+    }
+
+    private func stopMembershipRefreshLoop() {
+        membershipRefreshTask?.cancel()
+        membershipRefreshTask = nil
+    }
+
     private func returnToFreshRealLocation() {
         didApplyStartupLocation = false
         startupLocationProvider.requestCurrentLocation(allowCachedLocation: false)
@@ -203,6 +307,7 @@ struct MainTabView: View {
     private func stopBackgroundLocationIfSimulationIsInactive() {
         guard case nil = backgroundSimulationManager.currentMode,
               !sharedLocationMapState.isSimulationActive,
+              !sharedLocationMapState.isSimulationTransitioning,
               !sharedLocationMapState.isLocationRefreshCycleActive else { return }
 
         // 手動停止旗標若保留為 true，背景心跳流程可能再次 requestStart，
@@ -233,6 +338,7 @@ struct MainTabView: View {
             return AppFeature.mainTabs.contains(where: { $0.id == selection })
                 && !sharedLocationMapState.isSimulationActive
                 && !sharedLocationMapState.isMovementActive
+                && !sharedLocationMapState.isSimulationTransitioning
         }
         return false
     }
@@ -250,13 +356,13 @@ struct MainTabView: View {
         UserDefaults.standard.removeObject(forKey: UserDefaults.Keys.noSimulationBackgroundAt)
 
         // 保險地清除可能殘留的模擬設定，確保回到真實定位。
-        SimulationCoordinator.shared.stop(operation: "背景超時恢復真實定位") { result in
+        SimulationCoordinator.shared.stop(operation: "閒置背景恢復真實定位") { result in
             if case .success = result {
                 backgroundSimulationManager.markSimulationInactive()
                 performNoSimulationColdStartLocalReset()
             } else {
                 let reason = result.failure?.localizedDescription ?? "未知錯誤"
-                resetWarningMessage = "背景超時重置失敗，仍維持目前狀態：\(reason)"
+                resetWarningMessage = "閒置背景重置失敗，仍維持目前狀態：\(reason)"
                 showResetWarning = true
             }
         }
@@ -268,6 +374,7 @@ struct MainTabView: View {
         selection = AppFeature.home.id
         sharedLocationMapState.activeTabID = AppFeature.home.id
         sharedLocationMapState.isSimulationActive = false
+        sharedLocationMapState.isSimulationTransitioning = false
         sharedLocationMapState.isMovementActive = false
         sharedLocationMapState.requestedControlAction = nil
         sharedLocationMapState.requestedRouteID = nil

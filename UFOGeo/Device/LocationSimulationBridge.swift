@@ -1,21 +1,83 @@
 import Foundation
 
 enum LocationSimulationCommandQueue {
-    static let shared = DispatchQueue(label: "com.ufogo.location-sim", qos: .userInitiated)
+    static let shared = DispatchQueue(label: "com.UFOGeo.location-sim", qos: .userInitiated)
 
     static func preconditionIsolated() {
         dispatchPrecondition(condition: .onQueue(shared))
     }
 }
 
+/// A safe copy of an idevice FFI error made before the C error is freed.
+struct RemotePairingFFIError: Error, Equatable, Identifiable, LocalizedError, Sendable {
+    enum Operation: String, Equatable, Sendable {
+        case pairingRead
+        case tunnelHandshake
+        case remoteServer
+        case locationSimulation
+        case locationSet
+        case locationClear
+
+        var title: String {
+            switch self {
+            case .pairingRead: return "讀取 pairing file"
+            case .tunnelHandshake: return "Remote Pairing handshake"
+            case .remoteServer: return "RSD 服務連線"
+            case .locationSimulation: return "定位服務建立"
+            case .locationSet: return "設定模擬位置"
+            case .locationClear: return "清除模擬位置"
+            }
+        }
+    }
+
+    let id: String
+    let operation: Operation
+    let code: Int32
+    let subCode: Int32
+    let message: String
+
+    init(operation: Operation, code: Int32, subCode: Int32, message: String) {
+        self.operation = operation
+        self.code = code
+        self.subCode = subCode
+        self.message = message
+        self.id = operation.rawValue + "-" + String(code) + "-" + String(subCode)
+    }
+
+    var errorDescription: String? {
+        let detail = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        let safeDetail = detail.isEmpty ? "FFI 未提供錯誤訊息。" : detail
+        return operation.title
+            + "失敗（FFI error code "
+            + String(code)
+            + ", sub_code "
+            + String(subCode)
+            + "）："
+            + safeDetail
+    }
+}
+
 struct LocationSimulationError: Error, Equatable, Identifiable, LocalizedError {
     let code: Int32
     let operation: String
+    let ffiError: RemotePairingFFIError?
+
+    init(
+        code: Int32,
+        operation: String,
+        ffiError: RemotePairingFFIError? = nil
+    ) {
+        self.code = code
+        self.operation = operation
+        self.ffiError = ffiError
+    }
 
     var id: String { "\(operation)-\(code)" }
 
     var errorDescription: String? {
-        LocationSimulationErrorCatalog.message(for: code, operation: operation)
+        let baseMessage = LocationSimulationErrorCatalog.message(for: code, operation: operation)
+        guard let ffiError else { return baseMessage }
+        return "\(baseMessage)\n\(ffiError.localizedDescription)"
     }
 }
 
@@ -26,7 +88,44 @@ extension Result {
     }
 }
 
+/// Guarantees that a device command completes at most once.  The FFI call
+/// runs on the serialized command queue and cannot be force-cancelled safely,
+/// so the timeout path must be able to release its caller independently.
+private final class LocationSimulationCompletionGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var didComplete = false
+    private let completion: @MainActor (Result<Void, LocationSimulationError>) -> Void
+
+    init(
+        completion: @escaping @MainActor (Result<Void, LocationSimulationError>) -> Void
+    ) {
+        self.completion = completion
+    }
+
+    var isFinished: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return didComplete
+    }
+
+    func finish(_ result: Result<Void, LocationSimulationError>) {
+        lock.lock()
+        guard !didComplete else {
+            lock.unlock()
+            return
+        }
+        didComplete = true
+        lock.unlock()
+
+        Task { @MainActor in
+            completion(result)
+        }
+    }
+}
+
 private protocol DeviceLocationTransport: AnyObject {
+    var lastFFIError: RemotePairingFFIError? { get }
+
     func setLocation(
         deviceIP: String,
         latitude: Double,
@@ -41,16 +140,21 @@ private final class ClosureDeviceLocationTransport: DeviceLocationTransport {
     private let setOperation: (String, Double, Double, String) -> Int32
     private let clearOperation: () -> Int32
     private let resetOperation: () -> Void
+    private let ffiErrorOperation: () -> RemotePairingFFIError?
 
     init(
         setOperation: @escaping (String, Double, Double, String) -> Int32,
         clearOperation: @escaping () -> Int32,
-        resetOperation: @escaping () -> Void
+        resetOperation: @escaping () -> Void,
+        ffiErrorOperation: @escaping () -> RemotePairingFFIError?
     ) {
         self.setOperation = setOperation
         self.clearOperation = clearOperation
         self.resetOperation = resetOperation
+        self.ffiErrorOperation = ffiErrorOperation
     }
+
+    var lastFFIError: RemotePairingFFIError? { ffiErrorOperation() }
 
     func setLocation(
         deviceIP: String,
@@ -73,11 +177,13 @@ private final class ClosureDeviceLocationTransport: DeviceLocationTransport {
 /// Thread-safe because every transport access is serialized through `queue`.
 final class LocationSimulationService: @unchecked Sendable {
     static let shared = LocationSimulationService()
+    static let defaultCommandTimeout: TimeInterval = 15
 
     typealias Completion = @MainActor (Result<Void, LocationSimulationError>) -> Void
 
     private let queue: DispatchQueue
     private let transport: DeviceLocationTransport
+    private let commandTimeout: TimeInterval
 
     init(
         queue: DispatchQueue = LocationSimulationCommandQueue.shared,
@@ -94,14 +200,20 @@ final class LocationSimulationService: @unchecked Sendable {
         },
         resetOperation: @escaping () -> Void = {
             ProductionDeviceLocationTransport.shared.resetConnectionState()
-        }
+        },
+        ffiErrorOperation: @escaping () -> RemotePairingFFIError? = {
+            ProductionDeviceLocationTransport.shared.lastFFIError
+        },
+        commandTimeout: TimeInterval = LocationSimulationService.defaultCommandTimeout
     ) {
         self.queue = queue
         self.transport = ClosureDeviceLocationTransport(
             setOperation: setOperation,
             clearOperation: clearOperation,
-            resetOperation: resetOperation
+            resetOperation: resetOperation,
+            ffiErrorOperation: ffiErrorOperation
         )
+        self.commandTimeout = max(0.1, commandTimeout)
     }
 
     func setLocation(
@@ -112,15 +224,29 @@ final class LocationSimulationService: @unchecked Sendable {
         operation: String,
         completion: @escaping Completion
     ) {
+        let gate = LocationSimulationCompletionGate(completion: completion)
         queue.async {
+            guard !gate.isFinished else { return }
             let code = self.transport.setLocation(
                 deviceIP: deviceIP,
                 latitude: latitude,
                 longitude: longitude,
                 pairingFile: pairingFile
             )
-            let result = Self.result(code: code, operation: operation)
-            Task { @MainActor in completion(result) }
+            let result = Self.result(
+                code: code,
+                operation: operation,
+                ffiError: self.transport.lastFFIError
+            )
+            gate.finish(result)
+        }
+        DispatchQueue.global(qos: .utility).asyncAfter(
+            deadline: .now() + commandTimeout
+        ) {
+            gate.finish(.failure(LocationSimulationError(
+                code: 15,
+                operation: operation
+            )))
         }
     }
 
@@ -149,10 +275,24 @@ final class LocationSimulationService: @unchecked Sendable {
         after delay: TimeInterval = 0,
         completion: @escaping Completion
     ) {
+        let gate = LocationSimulationCompletionGate(completion: completion)
         queue.asyncAfter(deadline: .now() + delay) {
+            guard !gate.isFinished else { return }
             let code = self.transport.clearLocation()
-            let result = Self.result(code: code, operation: operation)
-            Task { @MainActor in completion(result) }
+            let result = Self.result(
+                code: code,
+                operation: operation,
+                ffiError: self.transport.lastFFIError
+            )
+            gate.finish(result)
+        }
+        DispatchQueue.global(qos: .utility).asyncAfter(
+            deadline: .now() + commandTimeout
+        ) {
+            gate.finish(.failure(LocationSimulationError(
+                code: 15,
+                operation: operation
+            )))
         }
     }
 
@@ -184,11 +324,16 @@ final class LocationSimulationService: @unchecked Sendable {
 
     static func result(
         code: Int32,
-        operation: String
+        operation: String,
+        ffiError: RemotePairingFFIError? = nil
     ) -> Result<Void, LocationSimulationError> {
         code == 0
             ? .success(())
-            : .failure(LocationSimulationError(code: code, operation: operation))
+            : .failure(LocationSimulationError(
+                code: code,
+                operation: operation,
+                ffiError: ffiError
+            ))
     }
 
     /// App 即將終止時同步清除定位（best-effort，在 ~5 秒視窗內完成）。
@@ -216,12 +361,14 @@ enum LocationSimulationErrorCatalog {
         .init(code: 11, title: "座標設定失敗", recovery: "請停止模擬、重新連線後再試一次。"),
         .init(code: 12, title: "清除模擬位置失敗", recovery: "目前可能沒有有效連線，請重新連線後再停止。"),
         .init(code: 13, title: "另一種模擬正在執行", recovery: "請先停止目前的定位模擬。"),
-        .init(code: 14, title: "尚未啟動模擬", recovery: "請先啟動定位後再更新座標。")
+        .init(code: 14, title: "尚未啟動模擬", recovery: "請先啟動定位後再更新座標。"),
+        .init(code: 15, title: "裝置指令逾時", recovery: "裝置沒有在期限內回應，請確認連線後再試一次。"),
+        .init(code: 17, title: "搖桿需要 Pro", recovery: "Free 可使用單點定位；升級 Pro 後即可使用搖桿連續移動。")
     ]
 
     static func definition(for code: Int32) -> LocationSimulationErrorDefinition {
         definitions.first(where: { $0.code == code })
-            ?? .init(code: code, title: "未知錯誤", recovery: "請重新連線；若持續發生，請保留錯誤碼回報。")
+            ?? .init(code: code, title: "未知錯誤", recovery: "請重新連線；若持續發生，請將錯誤碼寄至 leoohyeah.app@gmail.com。")
     }
 
     static func message(for code: Int32, operation: String) -> String {
@@ -234,6 +381,8 @@ enum LocationSimulationErrorCatalog {
 
 private final class ProductionDeviceLocationTransport: DeviceLocationTransport {
     static let shared = ProductionDeviceLocationTransport()
+
+    var lastFFIError: RemotePairingFFIError? { nil }
 
     func setLocation(
         deviceIP: String,
@@ -259,6 +408,22 @@ private final class ProductionDeviceLocationTransport: DeviceLocationTransport {
 
 import idevice
 
+private func consumeRemotePairingFFIError(
+    _ error: UnsafeMutablePointer<idevice.IdeviceFfiError>,
+    operation: RemotePairingFFIError.Operation
+) -> RemotePairingFFIError {
+    let code = error.pointee.code
+    let subCode = error.pointee.sub_code
+    let message = error.pointee.message.map(String.init(cString:)) ?? "FFI 未提供錯誤訊息。"
+    idevice_error_free(error)
+    return RemotePairingFFIError(
+        operation: operation,
+        code: code,
+        subCode: subCode,
+        message: message
+    )
+}
+
 private enum LocationSimulationStatus {
     static let ok: Int32 = 0
     static let invalidIP: Int32 = 1
@@ -277,6 +442,7 @@ private final class ProductionDeviceLocationTransport: DeviceLocationTransport {
     private var handshake: OpaquePointer?
     private var remoteServer: OpaquePointer?
     private var locationSimulation: OpaquePointer?
+    private(set) var lastFFIError: RemotePairingFFIError?
 
     private func cleanup() {
         if let locationSimulation {
@@ -304,10 +470,14 @@ private final class ProductionDeviceLocationTransport: DeviceLocationTransport {
         pairingFile: String
     ) -> Int32 {
         LocationSimulationCommandQueue.preconditionIsolated()
+        lastFFIError = nil
 
     if let locationSimulation {
         if let ffiError = location_simulation_set(locationSimulation, latitude, longitude) {
-            idevice_error_free(ffiError)
+            lastFFIError = consumeRemotePairingFFIError(
+                ffiError,
+                operation: .locationSet
+            )
             cleanup()
         } else {
             return LocationSimulationStatus.ok
@@ -324,16 +494,19 @@ private final class ProductionDeviceLocationTransport: DeviceLocationTransport {
     }
 
     var pairingHandle: OpaquePointer?
-    let pairingError = pairingFile.withCString { rp_pairing_file_read($0, &pairingHandle) }
+    let pairingError = pairingFile.withCString { path in
+        rp_pairing_file_read(path, &pairingHandle)
+    }
     if let pairingError {
-        idevice_error_free(pairingError)
+        lastFFIError = consumeRemotePairingFFIError(
+            pairingError,
+            operation: .pairingRead
+        )
         return LocationSimulationStatus.pairingRead
     }
-
     guard let pairingHandle else {
         return LocationSimulationStatus.pairingRead
     }
-
     defer { rp_pairing_file_free(pairingHandle) }
 
     let providerError = withUnsafePointer(to: &address) { pointer in
@@ -352,7 +525,10 @@ private final class ProductionDeviceLocationTransport: DeviceLocationTransport {
     }
 
     if let providerError {
-        idevice_error_free(providerError)
+        lastFFIError = consumeRemotePairingFFIError(
+            providerError,
+            operation: .tunnelHandshake
+        )
         cleanup()
         return LocationSimulationStatus.providerCreate
     }
@@ -363,7 +539,10 @@ private final class ProductionDeviceLocationTransport: DeviceLocationTransport {
         &remoteServer
     )
     if let remoteServerError {
-        idevice_error_free(remoteServerError)
+        lastFFIError = consumeRemotePairingFFIError(
+            remoteServerError,
+            operation: .remoteServer
+        )
         cleanup()
         return LocationSimulationStatus.remoteServer
     }
@@ -373,7 +552,10 @@ private final class ProductionDeviceLocationTransport: DeviceLocationTransport {
         &locationSimulation
     )
     if let locationSimulationError {
-        idevice_error_free(locationSimulationError)
+        lastFFIError = consumeRemotePairingFFIError(
+            locationSimulationError,
+            operation: .locationSimulation
+        )
         cleanup()
         return LocationSimulationStatus.locationSimulation
     }
@@ -386,7 +568,10 @@ private final class ProductionDeviceLocationTransport: DeviceLocationTransport {
         longitude
     )
     if let locationSetError {
-        idevice_error_free(locationSetError)
+        lastFFIError = consumeRemotePairingFFIError(
+            locationSetError,
+            operation: .locationSet
+        )
         cleanup()
         return LocationSimulationStatus.locationSet
     }
@@ -396,6 +581,7 @@ private final class ProductionDeviceLocationTransport: DeviceLocationTransport {
 
     func clearLocation() -> Int32 {
         LocationSimulationCommandQueue.preconditionIsolated()
+        lastFFIError = nil
 
     guard let locationSimulation else {
         // Stopping an already-stopped simulation is a successful no-op.
@@ -406,7 +592,10 @@ private final class ProductionDeviceLocationTransport: DeviceLocationTransport {
     cleanup()
 
     if let ffiError {
-        idevice_error_free(ffiError)
+        lastFFIError = consumeRemotePairingFFIError(
+            ffiError,
+            operation: .locationClear
+        )
         return LocationSimulationStatus.locationClear
     }
 
@@ -415,6 +604,7 @@ private final class ProductionDeviceLocationTransport: DeviceLocationTransport {
 
     func resetConnectionState() {
         LocationSimulationCommandQueue.preconditionIsolated()
+        lastFFIError = nil
         cleanup()
     }
 }

@@ -18,11 +18,15 @@ struct LocationSimulationUIView: View {
     @StateObject private var currentLocationProvider = CurrentLocationProvider()
     @StateObject private var routeImportManager = JoystickModeManager()
     @StateObject private var backgroundSimulationManager = BackgroundSimulationManager.shared
+    @StateObject private var portaly = PortalyCheckoutService.shared
+    @ObservedObject private var healthCoordinator = HealthWalkingCoordinator.shared
     
     // MARK: - 系統級資源（保留為 @State，涉及複雜生命週期）
     @State private var leafBackgroundTaskID: UIBackgroundTaskIdentifier = .invalid
     @State private var leafRefreshTask: Task<Void, Never>?
     @State private var resendTimer: Timer?
+    @State private var pendingDirectLocationCoordinate: CLLocationCoordinate2D?
+    @State private var joystickEntitlementPreflightID: UUID?
     
     private var pairingFilePath: String {
         PairingFileStore.prepareURL().path
@@ -32,6 +36,10 @@ struct LocationSimulationUIView: View {
     
     private var deviceIP: String {
         DeviceConnectionContext.targetIPAddress
+    }
+
+    private var canUseJoystick: Bool {
+        portaly.canUseJoystick
     }
 
     private var selectedCoordinate: CLLocationCoordinate2D? {
@@ -85,9 +93,11 @@ struct LocationSimulationUIView: View {
                 layout: layout,
                 isSimulating: uiState.isSimulating,
                 joystickDirectionLocked: uiState.joystickDirectionLocked,
+                isEnabled: canUseJoystick,
                 onDragChanged: handleJoystickDragChanged,
                 onDragEnded: handleJoystickDragEnded,
-                onDoubleTap: unlockJoystickDirection
+                onDoubleTap: unlockJoystickDirection,
+                onLockedTap: showJoystickUpgradePrompt
             )
 
             compactControlPanel
@@ -116,20 +126,23 @@ struct LocationSimulationUIView: View {
             Button("立即匯入") { uiState.showPairingImporter = true }
             Button("稍後", role: .cancel) { }
         } message: {
-            Text("請先匯入此 iPhone 的配對文件，才能使用定位與路線模擬。")
+            Text("請先手動匯入此 iPhone 的配對文件，才能使用定位與路線模擬。")
         }
         .sheet(isPresented: $uiState.showBookmarks, onDismiss: reopenSettingsIfNeeded) {
             UnifiedBookmarksView(
                 locationBookmarks: uiState.bookmarks,
                 onSelectLocation: { bookmark in
-                    selectLocation(bookmark.coordinate, recenter: true)
-                    uiState.showBookmarks = false
-                    guard uiState.isSimulating,
-                          !uiState.isProcessingSimulation else { return }
-                    updateActiveSimulationToCoordinateIfNeeded(
+                    handleSavedCoordinateSelection(
                         bookmark.coordinate,
                         operation: "收藏座標更新",
                         failureMessage: "收藏座標更新失敗"
+                    )
+                },
+                onSelectHistory: { coordinate in
+                    handleSavedCoordinateSelection(
+                        coordinate,
+                        operation: "歷史座標更新",
+                        failureMessage: "歷史座標更新失敗"
                     )
                 },
                 onLocationBookmarksChanged: { updated in
@@ -151,7 +164,8 @@ struct LocationSimulationUIView: View {
                     uiState.returnToSettingsAfterChild = true
                     uiState.showBookmarks = true
                 },
-                savedItemsTitle: "定位與路線收藏"
+                savedItemsTitle: "定位與路線收藏",
+                initialScrollTarget: uiState.openWalkingSectionInSettings ? .walkingHealth : nil
             )
         }
         .sheet(isPresented: $uiState.showRouteImporter, onDismiss: reopenSettingsIfNeeded) {
@@ -230,6 +244,9 @@ struct LocationSimulationUIView: View {
         .onReceive(NotificationCenter.default.publisher(for: .locationBookmarksDidChange)) { _ in
             loadBookmarks()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .pairingFileDidChange)) { _ in
+            refreshPairingExists()
+        }
         .onChange(of: uiState.isSimulating) { _, active in
             sharedMapState.isSimulationActive = active
             if !active {
@@ -246,6 +263,21 @@ struct LocationSimulationUIView: View {
             let clampedSpeed = min(max(newSpeed, 0), 1000)
             joystickManager.maxSpeed = clampedSpeed
         }
+        .onChange(of: canUseJoystick) { _, isAllowed in
+            if !isAllowed {
+                revokeJoystickAccess()
+            }
+        }
+        .onChange(of: uiState.isProcessingSimulation) { _, isProcessing in
+            if !isProcessing {
+                applyPendingDirectLocationIfPossible()
+            }
+        }
+        .onChange(of: sharedMapState.isSimulationTransitioning) { _, isTransitioning in
+            if !isTransitioning {
+                applyPendingDirectLocationIfPossible()
+            }
+        }
         .onReceive(sharedMapState.$requestedControlAction) { action in
             handleSharedControlAction(action)
         }
@@ -261,21 +293,21 @@ struct LocationSimulationUIView: View {
             routeImportManager.advanceForBackgroundHeartbeat(at: date)
             guard date.timeIntervalSince(uiState.lastHeartbeatKeepAliveAt) >= 2 else { return }
             uiState.lastHeartbeatKeepAliveAt = date
-
-            SimulationCoordinator.shared.update(
-                coordinate: coordinate,
-                deviceIP: deviceIP,
-                pairingFile: pairingFilePath,
-                operation: "背景維持模擬位置"
-            ) { _ in }
+            enqueueBackgroundHeartbeatUpdate(coordinate)
         }
         .onChange(of: scenePhase) { _, newPhase in
             handleScenePhaseChange(newPhase)
         }
         .onReceive(NotificationCenter.default.publisher(for: .locationSimulationDidExpire)) { _ in
+            pendingDirectLocationCoordinate = nil
+            uiState.invalidateSimulationCommands()
+            SimulationCoordinator.shared.invalidatePendingCommands()
+            SimulationCoordinator.shared.allowNextModeSwitchWhileHoldingLocation()
             uiState.isSimulating = false
             uiState.isManuallyStopped = false
+            sharedMapState.isSimulationTransitioning = false
             BackgroundLocationManager.shared.requestStop(for: .continuousLocation)
+            routeImportManager.stopStandaloneWalkingSession()
             stopResendLoop()
         }
         .onReceive(Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()) { _ in
@@ -283,6 +315,7 @@ struct LocationSimulationUIView: View {
             updateLocationFromJoystickIfNeeded()
         }
         .onDisappear {
+            pendingDirectLocationCoordinate = nil
             // 清理Timer資源
             resendTimer?.invalidate()
             resendTimer = nil
@@ -290,6 +323,10 @@ struct LocationSimulationUIView: View {
             // 清理Task資源
             leafRefreshTask?.cancel()
             leafRefreshTask = nil
+
+            uiState.invalidateSimulationCommands()
+            SimulationCoordinator.shared.invalidatePendingCommands()
+            sharedMapState.isSimulationTransitioning = false
             
             // 停止位置刷新循環
             sharedMapState.isLocationRefreshCycleActive = false
@@ -305,9 +342,13 @@ struct LocationSimulationUIView: View {
         sharedMapState.requestedControlAction = nil
         switch action {
         case .settings:
+            uiState.openWalkingSectionInSettings = false
             uiState.showCompatibilityCheck = true
         case .bookmarks:
             uiState.showBookmarks = true
+        case .walking:
+            uiState.openWalkingSectionInSettings = true
+            uiState.showCompatibilityCheck = true
         case .returnToRealLocation:
             returnToRealLocation()
         case .locationRefreshCycle:
@@ -317,11 +358,35 @@ struct LocationSimulationUIView: View {
             recenterMapOnSimulatedLocation()
         case .directLocation:
             // 未啟動時搜尋只移動鏡頭；定位模擬中才同步更新模擬座標。
-            guard uiState.isSimulating,
-                  !uiState.isProcessingSimulation,
-                  let coordinate = selectedCoordinate else { return }
-            updateActiveSimulationToCoordinateIfNeeded(coordinate)
+            handleDirectLocationRequest()
         }
+    }
+
+    private func handleDirectLocationRequest() {
+        guard let coordinate = selectedCoordinate else { return }
+        cancelJoystickMovementCommands()
+        guard uiState.isSimulating
+                || sharedMapState.isSimulationTransitioning else { return }
+        pendingDirectLocationCoordinate = coordinate
+        applyPendingDirectLocationIfPossible()
+    }
+
+    private func applyPendingDirectLocationIfPossible() {
+        guard let coordinate = pendingDirectLocationCoordinate else { return }
+        guard !sharedMapState.isSimulationTransitioning else { return }
+        guard uiState.isSimulating else {
+            pendingDirectLocationCoordinate = nil
+            return
+        }
+        guard !uiState.isProcessingSimulation else { return }
+        pendingDirectLocationCoordinate = nil
+        selectedCoordinate = coordinate
+        centerMapOnCoordinate(coordinate, preserveZoom: true)
+        updateActiveSimulationToCoordinateIfNeeded(
+            coordinate,
+            operation: "搜尋座標更新",
+            failureMessage: "搜尋座標更新失敗"
+        )
     }
     
 
@@ -372,6 +437,16 @@ struct LocationSimulationUIView: View {
             }
             .frame(height: 44, alignment: .top)
 
+            if uiState.isSimulating {
+                HStack {
+                    Label("累計 \(healthCoordinator.pendingSteps)", systemImage: "figure.walk")
+                    Spacer()
+                    Text("剩餘 \(healthCoordinator.remainingSteps) 步")
+                }
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(healthCoordinator.isEnabled ? .primary : .secondary)
+            }
+
             PrimaryActionButton(
                 isSimulating: uiState.isSimulating,
                 isProcessing: uiState.isProcessingSimulation,
@@ -383,7 +458,10 @@ struct LocationSimulationUIView: View {
         .padding(.horizontal, 16)
         .padding(.top, 8)
         .padding(.bottom, 10)
-        .frame(height: layout.compactPanelHeight, alignment: .bottom)
+        .frame(
+            height: layout.simulationCardHeight(isActive: uiState.isSimulating),
+            alignment: .bottom
+        )
         .animation(.spring(response: 0.3, dampingFraction: 0.8), value: uiState.isSimulating)
         .panelStyle(cornerRadius: 18)
         .shadow(color: .black.opacity(0.14), radius: 12, y: 4)
@@ -412,7 +490,7 @@ struct LocationSimulationUIView: View {
         if uiState.isSimulating, let coordinate = selectedCoordinate {
             return CoordinateDisplayFormatter.string(coordinate)
         }
-        if !pairingExists { return "點齒輪，導入配對文件後即可開始。" }
+        if !pairingExists { return "請先從齒輪選單手動匯入配對文件。" }
         if let coordinate = selectedCoordinate {
             return CoordinateDisplayFormatter.string(coordinate)
         }
@@ -426,7 +504,9 @@ struct LocationSimulationUIView: View {
                 set: { selectedCoordinate = $0 }
             ),
             rotation: locationMarkerRotation,
-            isMoving: uiState.isSimulating && (uiState.joystickTouchActive || uiState.joystickDirectionLocked),
+            isMoving: canUseJoystick
+                && uiState.isSimulating
+                && (uiState.joystickTouchActive || uiState.joystickDirectionLocked),
             onTap: { coordinate in
                 selectLocation(coordinate)
                 guard uiState.isSimulating,
@@ -443,11 +523,38 @@ struct LocationSimulationUIView: View {
     }
     
     private var primaryActionDisabled: Bool {
-        !pairingExists || selectedCoordinate == nil
+        selectedCoordinate == nil
     }
 
 
     private func handleJoystickDragChanged() {
+        guard canUseJoystick else {
+            revokeJoystickAccess()
+            return
+        }
+        if !uiState.joystickTouchActive,
+           portaly.needsProEntitlementRefresh {
+            guard joystickEntitlementPreflightID == nil else { return }
+            let preflightID = UUID()
+            joystickEntitlementPreflightID = preflightID
+            Task { @MainActor in
+                let allowed = await portaly.refreshProEntitlementIfNeeded()
+                guard joystickEntitlementPreflightID == preflightID else { return }
+                joystickEntitlementPreflightID = nil
+                guard allowed else {
+                    revokeJoystickAccess()
+                    showJoystickUpgradePrompt()
+                    return
+                }
+                guard joystickManager.isActive else { return }
+                applyJoystickDragChanged()
+            }
+            return
+        }
+        applyJoystickDragChanged()
+    }
+
+    private func applyJoystickDragChanged() {
         let now = Date()
 
         if uiState.isSimulating,
@@ -475,6 +582,11 @@ struct LocationSimulationUIView: View {
     }
 
     private func handleJoystickDragEnded() -> Bool {
+        joystickEntitlementPreflightID = nil
+        guard canUseJoystick else {
+            revokeJoystickAccess()
+            return false
+        }
         uiState.joystickTouchActive = false
         uiState.joystickHoldStartedAt = nil
         if !uiState.joystickDirectionLocked {
@@ -484,6 +596,10 @@ struct LocationSimulationUIView: View {
     }
 
     private func unlockJoystickDirection() {
+        guard canUseJoystick else {
+            revokeJoystickAccess()
+            return
+        }
         uiState.joystickDirectionLocked = false
         uiState.joystickTouchActive = false
         uiState.joystickHoldStartedAt = nil
@@ -500,13 +616,14 @@ struct LocationSimulationUIView: View {
 
 
     private func updateLocationFromJoystickIfNeeded() {
-        guard uiState.isSimulating,
+        guard canUseJoystick,
+              uiState.isSimulating,
               joystickManager.isActive,
               joystickManager.magnitude > 0,
               !uiState.isProcessingSimulation,
+              !uiState.backgroundHeartbeatCoalescer.isInFlight,
               pairingExists,
               let base = selectedCoordinate else { return }
-
 
         let now = Date()
         if uiState.joystickTouchActive,
@@ -551,28 +668,84 @@ struct LocationSimulationUIView: View {
         )
     }
 
+    private func enqueueBackgroundHeartbeatUpdate(_ coordinate: CLLocationCoordinate2D) {
+        guard let nextCoordinate = uiState.backgroundHeartbeatCoalescer.enqueue(coordinate) else {
+            return
+        }
+        let commandToken = uiState.beginBackgroundHeartbeatCommand()
+        sendBackgroundHeartbeatUpdate(
+            coordinate: nextCoordinate,
+            commandToken: commandToken
+        )
+    }
+
+    private func sendBackgroundHeartbeatUpdate(
+        coordinate: CLLocationCoordinate2D,
+        commandToken: Int
+    ) {
+        SimulationCoordinator.shared.update(
+            coordinate: coordinate,
+            deviceIP: deviceIP,
+            pairingFile: pairingFilePath,
+            intent: .fixedKeepAlive,
+            operation: "背景維持模擬位置"
+        ) { result in
+            guard uiState.isCurrentBackgroundHeartbeatCommand(commandToken) else {
+                return
+            }
+            let nextCoordinate = uiState.backgroundHeartbeatCoalescer.complete(
+                success: result.failure == nil
+            )
+            guard uiState.isSimulating || uiState.isManuallyStopped else {
+                uiState.backgroundHeartbeatCoalescer.cancel()
+                return
+            }
+            guard let nextCoordinate else { return }
+            let nextToken = uiState.beginBackgroundHeartbeatCommand()
+            sendBackgroundHeartbeatUpdate(
+                coordinate: nextCoordinate,
+                commandToken: nextToken
+            )
+        }
+    }
+
     private func sendJoystickCoordinateUpdate(
         coordinate: CLLocationCoordinate2D,
         previousCoordinate: CLLocationCoordinate2D,
         deviceIP: String,
-        pairingFile: String
+        pairingFile: String,
+        commandToken: Int? = nil
     ) {
+        guard canUseJoystick else {
+            selectedCoordinate = previousCoordinate
+            centerMapOnCoordinate(previousCoordinate, preserveZoom: true)
+            revokeJoystickAccess()
+            return
+        }
+        let commandToken = commandToken ?? uiState.beginJoystickCommand()
         uiState.joystickCommandInFlight = true
         SimulationCoordinator.shared.update(
             coordinate: coordinate,
             deviceIP: deviceIP,
             pairingFile: pairingFile,
+            intent: .joystickMovement,
             operation: "搖桿定位"
         ) { result in
+            guard uiState.isCurrentJoystickCommand(commandToken) else { return }
             uiState.joystickCommandInFlight = false
             if case .success = result {
-                guard let pending = uiState.pendingJoystickCoordinate else { return }
+                guard uiState.isSimulating,
+                      let pending = uiState.pendingJoystickCoordinate else {
+                    uiState.pendingJoystickCoordinate = nil
+                    return
+                }
                 uiState.pendingJoystickCoordinate = nil
                 sendJoystickCoordinateUpdate(
                     coordinate: pending,
                     previousCoordinate: coordinate,
                     deviceIP: deviceIP,
-                    pairingFile: pairingFile
+                    pairingFile: pairingFile,
+                    commandToken: commandToken
                 )
             } else {
                 uiState.pendingJoystickCoordinate = nil
@@ -586,6 +759,42 @@ struct LocationSimulationUIView: View {
                 uiState.showAlert = true
             }
         }
+    }
+
+    private func showJoystickUpgradePrompt() {
+        uiState.alertMessage = "搖桿移動是 Pro 功能。Free 可在前景或背景維持單一位置，且不設產品層時間上限；實際背景執行仍受 iOS 權限與系統排程影響。"
+        uiState.showAlert = true
+    }
+
+    private func revokeJoystickAccess() {
+        let lastConfirmedCoordinate = SimulationCoordinator.shared.lastCoordinate
+        let shouldRestoreConfirmedCoordinate = uiState.isSimulating
+            && pairingExists
+            && (uiState.joystickCommandInFlight || uiState.pendingJoystickCoordinate != nil)
+        cancelJoystickMovementCommands()
+
+        guard shouldRestoreConfirmedCoordinate,
+              let lastConfirmedCoordinate else { return }
+        selectedCoordinate = lastConfirmedCoordinate
+        centerMapOnCoordinate(lastConfirmedCoordinate, preserveZoom: true)
+        SimulationCoordinator.shared.update(
+            coordinate: lastConfirmedCoordinate,
+            deviceIP: deviceIP,
+            pairingFile: pairingFilePath,
+            intent: .fixedKeepAlive,
+            operation: "降級後維持最後單點"
+        ) { _ in }
+    }
+
+    private func cancelJoystickMovementCommands() {
+        joystickEntitlementPreflightID = nil
+        SimulationCoordinator.shared.invalidatePendingJoystickCommands()
+        uiState.invalidateJoystickCommands()
+        uiState.joystickDirectionLocked = false
+        uiState.joystickTouchActive = false
+        uiState.joystickHoldStartedAt = nil
+        joystickManager.reset(within: CGRect(x: 0, y: 0, width: 100, height: 100))
+        sharedMapState.isMovementActive = false
     }
     
     private func selectLocation(_ coordinate: CLLocationCoordinate2D, recenter: Bool = false) {
@@ -626,7 +835,7 @@ struct LocationSimulationUIView: View {
             return
         }
         guard pairingExists else {
-            uiState.alertMessage = "配對文件不存在，請先導入配對文件。"
+            uiState.alertMessage = "配對文件不存在，請先手動匯入配對文件。"
             uiState.showAlert = true
             return
         }
@@ -635,18 +844,11 @@ struct LocationSimulationUIView: View {
         }
         
         // 立即反饋：先顯示「正在連接」的狀態，優化用戶體驗
+        uiState.invalidateSimulationCommands()
+        let commandToken = uiState.beginSimulationCommand()
         uiState.isProcessingSimulation = true
+        sharedMapState.isSimulationTransitioning = true
         uiState.simulationStatus = "正在連接設備..."
-
-        // 15 秒 timeout：若裝置無回應，自動解鎖按鈕並提示。
-        let startTimeoutTask = Task { @MainActor in
-            try? await Task.sleep(for: .seconds(15))
-            guard uiState.isProcessingSimulation else { return }
-            uiState.isProcessingSimulation = false
-            uiState.simulationStatus = "連線逾時"
-            uiState.alertMessage = "連線逾時，請確認裝置已連線並重試。"
-            uiState.showAlert = true
-        }
 
         SimulationCoordinator.shared.start(
             mode: .fixedLocation,
@@ -655,10 +857,11 @@ struct LocationSimulationUIView: View {
             pairingFile: pairingFilePath,
             operation: "設定位置"
         ) { result in
-            startTimeoutTask.cancel()
+            guard uiState.isCurrentSimulationCommand(commandToken) else { return }
             uiState.isProcessingSimulation = false
             if case .success = result {
                 uiState.isSimulating = true
+                sharedMapState.isSimulationActive = true
                 uiState.isManuallyStopped = false
                 uiState.simulationStatus = "模擬位置設定成功"
                 LocationHistoryStore.add(
@@ -666,12 +869,15 @@ struct LocationSimulationUIView: View {
                     coordinate: coordinate
                 )
 
+                routeImportManager.startStandaloneWalkingSession()
+
                 updateResendLoopForCurrentState()
             } else {
                 uiState.simulationStatus = result.failure?.localizedDescription ?? "設定位置失敗"
                 uiState.alertMessage = uiState.simulationStatus
                 uiState.showAlert = true
             }
+            sharedMapState.isSimulationTransitioning = false
         }
     }
 
@@ -689,7 +895,8 @@ struct LocationSimulationUIView: View {
 
         // 取消任何仍在等待真實 GPS 的舊流程，避免其非同步回呼覆蓋啟動座標。
         uiState.isReturningToCurrentLocation = false
-        uiState.pendingJoystickCoordinate = nil
+        uiState.invalidateSimulationCommands()
+        SimulationCoordinator.shared.invalidatePendingCommands()
 
         switch LaunchCoordinateReturnPolicy.fixedLocationAction(
             isSimulating: uiState.isSimulating
@@ -720,13 +927,17 @@ struct LocationSimulationUIView: View {
             sharedMapState.isReturningToRealLocationInProgress = false
             return
         }
+        cancelJoystickMovementCommands()
+        let commandToken = uiState.beginSimulationCommand()
         uiState.isProcessingSimulation = true
         SimulationCoordinator.shared.update(
             coordinate: coordinate,
             deviceIP: deviceIP,
             pairingFile: pairingFilePath,
+            intent: .singlePoint,
             operation: "回到啟動位置"
         ) { result in
+            guard uiState.isCurrentSimulationCommand(commandToken) else { return }
             uiState.isProcessingSimulation = false
             sharedMapState.isReturningToRealLocationInProgress = false
             if case .success = result {
@@ -753,13 +964,17 @@ struct LocationSimulationUIView: View {
         failureMessage: String = "更新模擬座標失敗"
     ) {
         guard uiState.isSimulating else { return }
+        cancelJoystickMovementCommands()
+        let commandToken = uiState.beginSimulationCommand()
         uiState.isProcessingSimulation = true
         SimulationCoordinator.shared.update(
             coordinate: coordinate,
             deviceIP: deviceIP,
             pairingFile: pairingFilePath,
+            intent: .singlePoint,
             operation: operation
         ) { result in
+            guard uiState.isCurrentSimulationCommand(commandToken) else { return }
             uiState.isProcessingSimulation = false
             if case .success = result {
                 backgroundSimulationManager.markSimulationActive(
@@ -774,13 +989,35 @@ struct LocationSimulationUIView: View {
         }
     }
 
+    private func handleSavedCoordinateSelection(
+        _ coordinate: CLLocationCoordinate2D,
+        operation: String,
+        failureMessage: String
+    ) {
+        selectLocation(coordinate, recenter: true)
+        uiState.showBookmarks = false
+        guard uiState.isSimulating,
+              !uiState.isProcessingSimulation else { return }
+        updateActiveSimulationToCoordinateIfNeeded(
+            coordinate,
+            operation: operation,
+            failureMessage: failureMessage
+        )
+    }
+
     private func stopSimulation() {
+        pendingDirectLocationCoordinate = nil
+        uiState.invalidateSimulationCommands()
+        SimulationCoordinator.shared.invalidatePendingCommands()
         unlockJoystickDirection()
         uiState.isSimulating = false
         uiState.isManuallyStopped = true
+        uiState.isProcessingSimulation = false
         uiState.simulationStatus = "位置模擬已停止"
+        sharedMapState.isSimulationTransitioning = false
         sharedMapState.isSimulationActive = false
         sharedMapState.isMovementActive = false
+        routeImportManager.stopStandaloneWalkingSession()
         stopResendLoop()
         SimulationCoordinator.shared.allowNextModeSwitchWhileHoldingLocation()
         backgroundSimulationManager.markFixedManuallyStoppedHoldingLocation()
@@ -884,7 +1121,7 @@ struct LocationSimulationUIView: View {
         refreshPairingExists()
         loadBookmarks()
     }
-    
+
     private func refreshPairingExists() {
         #if targetEnvironment(simulator)
         cachedPairingExists = true
@@ -957,7 +1194,6 @@ struct LocationSimulationUIView: View {
         uiState.pendingBookmarkOverwrite = nil
     }
 
-    
     private func importPairingFile(_ result: Result<[URL], Error>) {
         switch result {
         case .success(let urls):
@@ -971,16 +1207,7 @@ struct LocationSimulationUIView: View {
                     }.value
                     
                     await MainActor.run {
-                        uiState.isImportingPairingFile = false
-                        refreshPairingExists()
-                        uiState.didApplyActualStartCoordinate = false
-                        uiState.isReturningToCurrentLocation = true
-                        uiState.requestAlwaysAfterPairingImport = true
-                        uiState.recenterAfterPairingAuthorization = true
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-                            requestAlwaysPermissionAfterPairingIfNeeded()
-                            currentLocationProvider.requestCurrentLocation(allowCachedLocation: false)
-                        }
+                        finishPairingImport()
                     }
                 } catch {
                     await MainActor.run {
@@ -996,6 +1223,19 @@ struct LocationSimulationUIView: View {
         }
     }
 
+    private func finishPairingImport() {
+        uiState.isImportingPairingFile = false
+        refreshPairingExists()
+        uiState.didApplyActualStartCoordinate = false
+        uiState.isReturningToCurrentLocation = true
+        uiState.requestAlwaysAfterPairingImport = true
+        uiState.recenterAfterPairingAuthorization = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            requestAlwaysPermissionAfterPairingIfNeeded()
+            currentLocationProvider.requestCurrentLocation(allowCachedLocation: false)
+        }
+    }
+
     private func requestAlwaysPermissionAfterPairingIfNeeded() {
         guard uiState.requestAlwaysAfterPairingImport else { return }
         uiState.requestAlwaysAfterPairingImport = false
@@ -1004,6 +1244,7 @@ struct LocationSimulationUIView: View {
 
     private func ensureRuntimeServicesForFixedSimulation() {
         BackgroundLocationManager.shared.requestStart(for: .continuousLocation)
+        routeImportManager.startStandaloneWalkingSession()
         updateResendLoopForCurrentState()
     }
 
@@ -1044,14 +1285,21 @@ struct LocationSimulationUIView: View {
                 guard uiState.isSimulating,
                       !uiState.isProcessingSimulation,
                       !uiState.joystickCommandInFlight,
+                      !uiState.backgroundHeartbeatCoalescer.isInFlight,
                       let coordinate = selectedCoordinate else { return }
-                
+
+                let commandToken = uiState.beginSimulationCommand()
+                uiState.isProcessingSimulation = true
                 SimulationCoordinator.shared.update(
                     coordinate: coordinate,
                     deviceIP: deviceIP,
                     pairingFile: pairingFilePath,
+                    intent: .fixedKeepAlive,
                     operation: "維持模擬位置"
-                ) { _ in }
+                ) { _ in
+                    guard uiState.isCurrentSimulationCommand(commandToken) else { return }
+                    uiState.isProcessingSimulation = false
+                }
             }
         }
     }

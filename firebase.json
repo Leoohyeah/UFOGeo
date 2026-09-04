@@ -1,0 +1,51 @@
+{
+  "firestore": {
+    "database": "(default)",
+    "location": "asia-east1",
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
+  },
+  "functions": [
+    {
+      "source": "functions",
+      "codebase": "default",
+      "disallowLegacyRuntimeConfig": true,
+      "ignore": [
+        "node_modules",
+        ".git",
+        "firebase-debug.log",
+        "firebase-debug.*.log",
+        "*.local"
+      ]
+    }
+  ],
+  "hosting": {
+    "public": "docs",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ],
+    "headers": [
+      {
+        "source": "**",
+        "headers": [
+          {"key": "Strict-Transport-Security", "value": "max-age=31536000"},
+          {"key": "X-Content-Type-Options", "value": "nosniff"},
+          {"key": "X-Frame-Options", "value": "DENY"},
+          {"key": "Referrer-Policy", "value": "strict-origin-when-cross-origin"},
+          {"key": "Permissions-Policy", "value": "camera=(), microphone=(), geolocation=()"}
+        ]
+      }
+    ],
+    "rewrites": [
+      {
+        "source": "/api/**",
+        "function": {
+          "functionId": "api",
+          "region": "asia-east1"
+        }
+      }
+    ]
+  }
+}

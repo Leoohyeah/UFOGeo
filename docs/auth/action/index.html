@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>UFOGeo 帳號操作</title>
+  <link rel="stylesheet" href="../../styles.css">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <main class="card auth-action-card" aria-live="polite">
+    <div class="icon" aria-hidden="true">🛸</div>
+    <p class="eyebrow">UFOGeo 帳號</p>
+    <h1 id="pageTitle">正在處理</h1>
+    <p id="pageDescription" class="intro">請稍候。</p>
+
+    <div id="status" class="status info" role="status">
+      正在確認連結。
+    </div>
+
+    <form id="resetForm" hidden>
+      <label for="accountEmail">帳號電子郵件</label>
+      <input id="accountEmail" type="email" autocomplete="email" readonly>
+
+      <label for="newPassword">新密碼</label>
+      <input id="newPassword" type="password" autocomplete="new-password" minlength="6" required>
+      <p class="hint muted">至少 6 個字元。</p>
+
+      <label for="confirmPassword">再次輸入新密碼</label>
+      <input id="confirmPassword" type="password" autocomplete="new-password" minlength="6" required>
+
+      <button id="resetButton" class="action-button" type="submit">
+        確認重設密碼
+      </button>
+    </form>
+
+    <a id="continueLink" class="continue-link" hidden rel="noopener">
+      返回 UFOGeo
+    </a>
+  </main>
+
+  <noscript>
+    <p>請開啟 JavaScript 才能完成帳號操作。</p>
+  </noscript>
+  <!-- Firebase Hosting supplies the project configuration through this endpoint. -->
+  <script src="https://www.gstatic.com/firebasejs/12.18.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/12.18.0/firebase-auth-compat.js"></script>
+  <script src="https://ufogeo-adac7.web.app/__/firebase/init.js"></script>
+  <script src="./action.js"></script>
+</body>
+</html>

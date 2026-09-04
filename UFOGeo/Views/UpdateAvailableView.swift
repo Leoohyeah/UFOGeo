@@ -83,7 +83,7 @@ struct UpdateAvailableView: View {
                     name: "Version 1.1.0",
                     body: "新增路線回放功能、修復位置更新延遲問題",
                     releaseDate: "2026-07-29",
-                    downloadUrl: "https://github.com/yourusername/UFOGeo-main/releases"
+                    downloadUrl: "https://github.com/Leoohyeah/UFOGeo-Health/releases"
                 )
                 return manager
             }()

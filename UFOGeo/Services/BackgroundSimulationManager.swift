@@ -58,9 +58,20 @@ final class BackgroundSimulationManager: ObservableObject {
         clearPersistedMode()
     }
 
-    func notifySimulationActiveIfNeeded() {
+    func notifySimulationActiveIfNeeded(backgroundLocationAvailable: Bool) {
         guard currentMode != nil else { return }
         guard !isRoutePaused else { return }
+        if currentMode == .route,
+           !PortalyCheckoutService.shared.canUseBackgroundRouteSimulation {
+            return
+        }
+        guard backgroundLocationAvailable else {
+            postNotification(
+                body: "請回到 App，將定位權限改為「永遠」；目前無法在背景維持模擬。",
+                modeKey: "background-unavailable"
+            )
+            return
+        }
         postSimulationActiveNotification()
     }
 
@@ -69,7 +80,7 @@ final class BackgroundSimulationManager: ObservableObject {
         let modeKey: String
         switch currentMode {
         case .fixedLocation:
-            body = "定位模擬進行中。"
+            body = "單點定位正在背景維持。"
             modeKey = "fixed"
         case .route:
             body = "路線模擬進行中。"
@@ -78,6 +89,10 @@ final class BackgroundSimulationManager: ObservableObject {
             return
         }
 
+        postNotification(body: body, modeKey: modeKey)
+    }
+
+    private func postNotification(body: String, modeKey: String) {
         let now = Date()
         if let lastAt = lastBackgroundNotificationAt,
            let lastModeKey = lastBackgroundNotificationModeKey,
@@ -92,7 +107,7 @@ final class BackgroundSimulationManager: ObservableObject {
         content.title = "UFOGeo"
         content.body = body
         content.sound = nil
-        let identifier = "com.ufogo.simulation-background.\(modeKey).\(Int(now.timeIntervalSince1970 * 1000))"
+        let identifier = "com.ufogeo.simulation-background.\(modeKey).\(Int(now.timeIntervalSince1970 * 1000))"
         let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false)
         let request = UNNotificationRequest(
             identifier: identifier,

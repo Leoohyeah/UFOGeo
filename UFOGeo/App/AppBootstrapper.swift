@@ -4,18 +4,7 @@ import UIKit
 
 enum AppBootstrapper {
     static func configure() {
-        registerDefaultSettings()
         applyDocumentPickerCopyWorkaround()
-    }
-
-    private static func registerDefaultSettings() {
-        let os = ProcessInfo.processInfo.operatingSystemVersion
-        let enableAdvancedOptions = os.majorVersion >= 19
-
-        UserDefaults.standard.register(defaults: [
-            "enableAdvancedOptions": enableAdvancedOptions,
-            "keepAliveLocation": true
-        ])
     }
 
     private static func applyDocumentPickerCopyWorkaround() {

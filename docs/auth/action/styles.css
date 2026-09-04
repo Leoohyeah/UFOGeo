@@ -1,0 +1,110 @@
+.auth-action-card {
+  text-align: left;
+}
+
+.auth-action-card .icon,
+.auth-action-card > h1,
+.auth-action-card > .eyebrow,
+.auth-action-card > .intro {
+  text-align: center;
+}
+
+.auth-action-card .eyebrow {
+  margin: 14px 0 0;
+  color: #aebed3;
+  font-size: 14px;
+}
+
+.auth-action-card h1 {
+  margin-top: 8px;
+}
+
+.auth-action-card h1 span,
+.auth-action-card label span,
+.auth-action-card button span,
+.auth-action-card a span {
+  font-weight: 400;
+}
+
+.auth-action-card form {
+  margin-top: 24px;
+}
+
+.auth-action-card label {
+  display: block;
+  margin: 16px 0 6px;
+  font-weight: 600;
+}
+
+.auth-action-card input {
+  width: 100%;
+  border: 1px solid rgba(255, 255, 255, .22);
+  border-radius: 12px;
+  padding: 12px 14px;
+  color: inherit;
+  background: rgba(255, 255, 255, .08);
+  font: inherit;
+}
+
+.auth-action-card input:disabled {
+  opacity: .75;
+}
+
+.auth-action-card .hint {
+  margin-top: 6px;
+  font-size: 13px;
+}
+
+.auth-action-card .action-button,
+.auth-action-card .continue-link {
+  display: block;
+  width: 100%;
+  margin-top: 22px;
+  padding: 13px 16px;
+  border: 0;
+  border-radius: 13px;
+  color: #07111f;
+  background: #64e6ae;
+  font: inherit;
+  font-weight: 700;
+  text-align: center;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.auth-action-card .action-button:disabled {
+  cursor: wait;
+  opacity: .65;
+}
+
+.auth-action-card .continue-link {
+  color: #f7fbff;
+  background: rgba(255, 255, 255, .14);
+}
+
+.auth-action-card .status {
+  margin: 18px 0 0;
+  padding: 12px 14px;
+  border-radius: 12px;
+  line-height: 1.6;
+  white-space: pre-line;
+}
+
+.auth-action-card .status.error {
+  color: #ffd4d4;
+  background: rgba(215, 70, 70, .22);
+}
+
+.auth-action-card .status.success {
+  color: #d5ffe9;
+  background: rgba(62, 179, 125, .18);
+}
+
+.auth-action-card .status.info {
+  color: #dbeeff;
+  background: rgba(65, 158, 208, .18);
+}
+
+.auth-action-card [hidden] {
+  display: none !important;
+}

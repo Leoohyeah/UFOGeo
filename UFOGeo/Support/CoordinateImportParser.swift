@@ -5,37 +5,44 @@ import UniformTypeIdentifiers
 enum CoordinateImportError: LocalizedError {
     case emptyFile
     case noCoordinates
+    case unsupportedFileExtension(String)
 
     var errorDescription: String? {
         switch self {
         case .emptyFile: return "匯入的檔案是空的。"
         case .noCoordinates:
             return "找不到有效座標。支援 GPX、KML、GeoJSON、JSON、CSV 或純文字格式（緯度、經度）。"
+        case .unsupportedFileExtension(let fileExtension):
+            let suffix = fileExtension.isEmpty ? "（無副檔名）" : ".\(fileExtension)"
+            return "不支援的路線檔案副檔名：\(suffix)。請選擇 GPX、KML、GeoJSON、JSON、CSV 或 TXT 檔案。"
         }
     }
 }
 
 enum CoordinateImportParser {
-    static let supportedContentTypes: [UTType] = [
-        .plainText, .commaSeparatedText, .json, .xml,
-        UTType(filenameExtension: "gpx", conformingTo: .xml) ?? .xml,
-        UTType(filenameExtension: "kml", conformingTo: .xml) ?? .xml,
-        UTType(filenameExtension: "geojson", conformingTo: .json) ?? .json
+    static let supportedFileExtensions: Set<String> = [
+        "gpx", "kml", "geojson", "json", "csv", "txt"
     ]
 
+    // Kept as a narrowly scoped convenience for callers that intentionally
+    // want a GPX-only picker. It must never fall back to the generic XML type.
     static let gpxContentTypes: [UTType] = [
-        UTType(filenameExtension: "gpx", conformingTo: .xml) ?? .xml
+        UTType(filenameExtension: "gpx")!
     ]
 
     static func parse(url: URL) throws -> [CLLocationCoordinate2D] {
+        let fileExtension = url.pathExtension.lowercased()
+        guard supportedFileExtensions.contains(fileExtension) else {
+            throw CoordinateImportError.unsupportedFileExtension(fileExtension)
+        }
+
         let accessing = url.startAccessingSecurityScopedResource()
         defer { if accessing { url.stopAccessingSecurityScopedResource() } }
 
         let data = try Data(contentsOf: url)
         guard !data.isEmpty else { throw CoordinateImportError.emptyFile }
-        let fileExtension = url.pathExtension.lowercased()
 
-        if ["gpx", "kml", "xml"].contains(fileExtension) {
+        if ["gpx", "kml"].contains(fileExtension) {
             let coordinates = parseXMLCoordinates(from: data)
             if !coordinates.isEmpty { return coordinates }
         }

@@ -3,6 +3,12 @@ import MapKit
 import UniformTypeIdentifiers
 import UIKit
 
+enum RouteHistorySelectionPolicy {
+    static func shouldPauseAndPush(isSimulating: Bool, isPaused: Bool) -> Bool {
+        isSimulating || isPaused
+    }
+}
+
 struct PathSimulationView: View {
     @EnvironmentObject private var sharedMapState: SharedLocationMapState
     @Environment(\.adaptiveLayout) private var layout
@@ -12,6 +18,8 @@ struct PathSimulationView: View {
     @AppStorage(UserDefaults.Keys.routePlanningMode) private var routePlanningModeRaw: String = RoutePlanningMode.direct.rawValue
     @AppStorage(UserDefaults.Keys.routeOrbitRadiusMeters) private var routeOrbitRadiusMeters: Int = 30
     @StateObject private var modeManager = JoystickModeManager()
+    @StateObject private var portaly = PortalyCheckoutService.shared
+    @ObservedObject private var healthCoordinator = HealthWalkingCoordinator.shared
     @StateObject private var currentLocationProvider = CurrentLocationProvider()
     @State private var isReturningToCurrentLocation = false
     @State private var recenterAfterPairingAuthorization = false
@@ -19,8 +27,10 @@ struct PathSimulationView: View {
     @State private var showPairingImporter = false
     @State private var showSettings = false
     @State private var showUnifiedBookmarks = false
+    @State private var openWalkingSectionInSettings = false
     @State private var returnToSettingsAfterChild = false
     @State private var showAlert = false
+    @State private var alertTitle = "路線提示"
     @State private var alertMessage = ""
     @State private var inlineEditingRoute: SimulationRoute?
     @State private var selectedInlinePointID: UUID?
@@ -34,13 +44,18 @@ struct PathSimulationView: View {
     @State private var showInlineCoordinatePaste = false
     @State private var inlineCoordinateText = ""
     @State private var isStartingRoute = false
+    @State private var routeStartGeneration = 0
     @State private var shouldReturnToLaunchAfterRouteStart = false
     @State private var lastRoutePushAt: Date = .distantPast
-    @State private var routeLocationCommandInFlight = false
+    @State private var routeLocationCommandInFlightGeneration: Int?
+    @State private var routeLocationCommandGeneration = 0
     @State private var pendingStoppedRouteCoordinate: CLLocationCoordinate2D?
+    @State private var pendingRouteHistoryCoordinate: CLLocationCoordinate2D?
     @State private var isReturningStoppedRouteToLaunch = false
     @State private var stableRouteHeading: Double = 0
     @State private var previousRouteLocation: CLLocationCoordinate2D?
+    @State private var routePausedForFreeBackground = false
+    @State private var shouldPresentFreeBackgroundPauseAlert = false
     @StateObject private var backgroundSimulationManager = BackgroundSimulationManager.shared
 
     @State private var pairingExists: Bool = false
@@ -55,6 +70,18 @@ struct PathSimulationView: View {
 
     private var routeIDs: [UUID] {
         modeManager.routes.map { $0.id }
+    }
+
+    private var isProUser: Bool {
+        portaly.isPro
+    }
+
+    private var isRouteInteractionLocked: Bool {
+        sharedMapState.isSimulationInteractionLocked
+    }
+
+    private var isRouteLocationCommandInFlight: Bool {
+        routeLocationCommandInFlightGeneration != nil
     }
 
     private var completionModeSummary: String {
@@ -83,14 +110,16 @@ struct PathSimulationView: View {
                modeManager.isSimulating || modeManager.isPaused {
                 SimulationProgressView(
                     modeManager: modeManager,
+                    healthCoordinator: healthCoordinator,
                     route: runningRoute,
                     speed: $simulationSpeed,
                     onStop: { stopRouteSimulationNow() }
                 )
-                .padding(.horizontal, 16)
-                .padding(.top, 8)
-                .padding(.bottom, 10)
-                .frame(height: layout.compactPanelHeight, alignment: .bottom)
+                .padding(16)
+                .frame(
+                    height: layout.simulationCardHeight(isActive: true),
+                    alignment: .bottom
+                )
                 .panelStyle(cornerRadius: 18)
                 .shadow(color: .black.opacity(0.14), radius: 12, y: 4)
                 .padding(.horizontal, layout.horizontalPadding)
@@ -141,11 +170,16 @@ struct PathSimulationView: View {
                     returnToSettingsAfterChild = true
                     showUnifiedBookmarks = true
                 },
-                savedItemsTitle: "定位與路線收藏"
+                savedItemsTitle: "定位與路線收藏",
+                initialScrollTarget: openWalkingSectionInSettings ? .walkingHealth : nil
             )
         }
         .sheet(isPresented: $showUnifiedBookmarks, onDismiss: { reopenSettingsIfNeeded() }) {
-            UnifiedBookmarksView()
+            UnifiedBookmarksView(
+                onSelectHistory: { coordinate in
+                    handleRouteHistorySelection(coordinate)
+                }
+            )
         }
         .sheet(isPresented: $showInlineCoordinatePaste) {
             inlineCoordinatePasteSheet
@@ -154,8 +188,10 @@ struct PathSimulationView: View {
 
     private var dialogContent: some View {
         presentationContent
-        .alert("提示", isPresented: $showAlert) {
-            Button("確定", role: .cancel) { }
+        .alert(alertTitle, isPresented: $showAlert) {
+            Button("確定", role: .cancel) {
+                alertTitle = "路線提示"
+            }
         } message: {
             Text(alertMessage)
         }
@@ -189,18 +225,37 @@ struct PathSimulationView: View {
                 sharedMapState.isMovementActive = modeManager.isSimulating && simulationSpeed > 0
                 if modeManager.isPaused {
                     backgroundSimulationManager.setRoutePaused(true)
-                    // 暫停、停止或完成後都保留心跳，只重送同一座標固定定位。
-                    BackgroundLocationManager.shared.requestStart(for: .route)
+                    if isProUser {
+                        // Pro 暫停或完成後保留心跳，只重送同一座標固定定位。
+                        BackgroundLocationManager.shared.requestStart(for: .route)
+                    } else {
+                        BackgroundLocationManager.shared.requestStop(for: .route)
+                    }
                 } else if modeManager.isSimulating {
+                    routePausedForFreeBackground = false
                     backgroundSimulationManager.setRoutePaused(false)
-                    BackgroundLocationManager.shared.requestStart(for: .route)
+                    recenterMapOnSimulatedLocation()
+                    if isProUser {
+                        BackgroundLocationManager.shared.requestStart(for: .route)
+                    } else {
+                        BackgroundLocationManager.shared.requestStop(for: .route)
+                    }
+                } else {
+                    routePausedForFreeBackground = false
                 }
             }
             .onChange(of: simulationSpeed) { _, newSpeed in
                 modeManager.simulationSpeed = min(max(newSpeed, 0), 1000)
             }
+            .onChange(of: isProUser) { _, isPro in
+                guard !isPro else { return }
+                BackgroundLocationManager.shared.requestStop(for: .route)
+                pauseFreeRouteForBackgroundIfNeeded()
+            }
             .onChange(of: selectedRouteID) { _, newID in
-                guard !modeManager.isSimulating, !modeManager.isPaused else { return }
+                guard !isRouteInteractionLocked,
+                      !modeManager.isSimulating,
+                      !modeManager.isPaused else { return }
                 guard let newID,
                       let route = modeManager.routes.first(where: { $0.id == newID }),
                       let firstPoint = route.points.first?.coordinate else { return }
@@ -209,6 +264,7 @@ struct PathSimulationView: View {
                 centerMapOnRoutePoint(firstPoint)
             }
             .onChange(of: routeIDs) { _, _ in
+                guard !isRouteInteractionLocked else { return }
                 if modeManager.routes.isEmpty {
                     selectedRouteID = nil
                 } else if let id = selectedRouteID,
@@ -228,7 +284,9 @@ struct PathSimulationView: View {
                 pushRouteLocationUpdateIfNeeded(newLocation)
             }
             .onReceive(NotificationCenter.default.publisher(for: .backgroundLocationHeartbeat)) { notification in
-                guard scenePhase != .active else { return }
+                guard scenePhase != .active,
+                      isProUser,
+                      !routePausedForFreeBackground else { return }
                 let date = notification.userInfo?["date"] as? Date ?? Date()
                 modeManager.advanceForBackgroundHeartbeat(at: date)
                 pushRouteLocationUpdateIfNeeded(modeManager.currentLocation)
@@ -272,8 +330,14 @@ struct PathSimulationView: View {
                 switch phase {
                 case .active:
                     refreshPairingExists()
+                    if shouldPresentFreeBackgroundPauseAlert {
+                        shouldPresentFreeBackgroundPauseAlert = false
+                        alertTitle = "路線已暫停"
+                        alertMessage = "Free 僅支援前景路線，按播放可繼續。"
+                        showAlert = true
+                    }
                 case .background:
-                    break
+                    pauseFreeRouteForBackgroundIfNeeded()
                 case .inactive:
                     break
                 @unknown default:
@@ -312,6 +376,7 @@ struct PathSimulationView: View {
                 positionRouteMapForEntryIfActive()
             }
             .onReceive(NotificationCenter.default.publisher(for: .simulationRoutesDidChange)) { _ in
+                guard !isRouteInteractionLocked else { return }
                 let previousSelection = selectedRouteID
                 modeManager.reloadRoutes()
                 if let previousSelection,
@@ -322,7 +387,19 @@ struct PathSimulationView: View {
                 }
             }
             .onReceive(NotificationCenter.default.publisher(for: .routeSimulationDidExpire)) { _ in
+                routeStartGeneration &+= 1
+                routeLocationCommandGeneration &+= 1
+                routeLocationCommandInFlightGeneration = nil
+                pendingStoppedRouteCoordinate = nil
+                pendingRouteHistoryCoordinate = nil
+                isReturningStoppedRouteToLaunch = false
+                isStartingRoute = false
+                SimulationCoordinator.shared.invalidatePendingCommands()
+                SimulationCoordinator.shared.allowNextModeSwitchWhileHoldingLocation()
                 modeManager.stopPathSimulation()
+                sharedMapState.isSimulationTransitioning = false
+                sharedMapState.isSimulationActive = false
+                sharedMapState.isMovementActive = false
                 BackgroundLocationManager.shared.requestStop(for: .route)
             }
             .onReceive(NotificationCenter.default.publisher(for: .pairingFileDidChange)) { _ in
@@ -332,7 +409,24 @@ struct PathSimulationView: View {
                 NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)
             ) { _ in
                 refreshPairingExists()
+                guard isProUser,
+                      !routePausedForFreeBackground else { return }
                 modeManager.advanceForBackgroundHeartbeat()
+            }
+            .onDisappear {
+                if isStartingRoute {
+                    routeStartGeneration &+= 1
+                    isStartingRoute = false
+                    SimulationCoordinator.shared.invalidatePendingCommands()
+                }
+                routeLocationCommandGeneration &+= 1
+                routeLocationCommandInFlightGeneration = nil
+                pendingStoppedRouteCoordinate = nil
+                pendingRouteHistoryCoordinate = nil
+                isReturningStoppedRouteToLaunch = false
+                if !sharedMapState.isSimulationActive {
+                    sharedMapState.isSimulationTransitioning = false
+                }
             }
     }
 
@@ -344,7 +438,8 @@ struct PathSimulationView: View {
                 sharedMapState: sharedMapState,
                 isEditing: inlineEditingRoute != nil
                     && !modeManager.isSimulating
-                    && !modeManager.isPaused,
+                    && !modeManager.isPaused
+                    && !isRouteInteractionLocked,
                 isSimulationActive: modeManager.isSimulating,
                 simulatedCoordinate: routeMarkerCoordinate,
                 simulatedHeading: stableRouteHeading,
@@ -380,9 +475,13 @@ struct PathSimulationView: View {
         sharedMapState.requestedControlAction = nil
         switch action {
         case .settings:
+            openWalkingSectionInSettings = false
             showSettings = true
         case .bookmarks:
             showUnifiedBookmarks = true
+        case .walking:
+            openWalkingSectionInSettings = true
+            showSettings = true
         case .returnToRealLocation:
             returnToLaunchLocation()
         case .locationRefreshCycle:
@@ -412,6 +511,10 @@ struct PathSimulationView: View {
 
     private func applyRequestedRoute(_ routeID: UUID?) {
         guard let routeID = routeID else { return }
+        guard !isRouteInteractionLocked else {
+            sharedMapState.requestedRouteID = nil
+            return
+        }
         modeManager.reloadRoutes()
         guard let route = modeManager.routes.first(where: { $0.id == routeID }) else {
             sharedMapState.requestedRouteID = nil
@@ -446,17 +549,49 @@ struct PathSimulationView: View {
 
     private var controlPanel: some View {
         VStack(spacing: 14) {
+            if !pairingExists {
+                startupGuidePanel
+            }
             routeModePanel
         }
         .padding(.horizontal, 16)
         .padding(.top, 8)
         .padding(.bottom, 10)
         .frame(
-            height: inlineEditingRoute == nil ? layout.compactPanelHeight : nil,
+            height: inlineEditingRoute == nil
+                ? layout.simulationCardHeight(isActive: false)
+                : nil,
             alignment: .bottom
         )
         .panelStyle(cornerRadius: 18)
         .shadow(color: .black.opacity(0.14), radius: 12, y: 4)
+    }
+
+    private var startupGuidePanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "checklist")
+                    .font(.headline)
+                    .foregroundStyle(.orange)
+                    .frame(width: 22)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("首次使用導引")
+                        .font(.subheadline.weight(.semibold))
+                    Text("請先從設定手動匯入此 iPhone 的配對文件；完成前這段提醒會持續保留。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer(minLength: 0)
+            }
+
+            Label("Free 可在 App 前景執行；Pro 可在背景繼續", systemImage: "info.circle")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(12)
+        .background(Color(.secondarySystemBackground).opacity(0.9), in: RoundedRectangle(cornerRadius: 14))
     }
 
     private var routeModePanel: some View {
@@ -502,6 +637,7 @@ struct PathSimulationView: View {
 
                     HStack(spacing: 0) {
                         PanelActionIconButton(systemName: "pencil") {
+                            guard !isRouteInteractionLocked else { return }
                             withAnimation(AnimationPreferences.slow) {
                                 beginInlineRouteEditing(route)
                             }
@@ -517,6 +653,7 @@ struct PathSimulationView: View {
                             systemName: route.isFavorite ? "bookmark.fill" : "bookmark",
                             foregroundStyle: route.isFavorite ? .accentColor : .secondary
                         ) {
+                            guard !isRouteInteractionLocked else { return }
                             modeManager.toggleFavorite(route)
                         }
                         .accessibilityLabel(route.isFavorite ? "從收藏移除路線" : "將路線加入收藏")
@@ -581,6 +718,7 @@ struct PathSimulationView: View {
 
             routeStartButton
         }
+        .disabled(isRouteInteractionLocked)
         .confirmationDialog("放棄路線編輯？", isPresented: $showDiscardInlineEditConfirm, titleVisibility: .visible) {
             Button("放棄變更", role: .destructive) { cancelInlineEditing() }
             Button("繼續編輯", role: .cancel) { }
@@ -730,6 +868,7 @@ struct PathSimulationView: View {
     }
 
     private func startCurrentRoute() {
+        guard !isRouteInteractionLocked else { return }
         if inlineEditingRoute != nil {
             startInlineRouteSimulation()
         } else if let route = selectedRoute {
@@ -762,6 +901,7 @@ struct PathSimulationView: View {
     }
 
     private func beginInlineRouteCreation() {
+        guard !isRouteInteractionLocked else { return }
         inlineEditingRoute = modeManager.createNewRoute(
             name: RouteNameGenerator.nextAvailableName(in: modeManager.routes)
         )
@@ -770,18 +910,22 @@ struct PathSimulationView: View {
     }
 
     private func beginInlineRouteEditing(_ route: SimulationRoute) {
+        guard !isRouteInteractionLocked else { return }
         inlineEditingRoute = route
         selectedInlinePointID = nil
     }
 
     private func addInlinePoint(_ coordinate: CLLocationCoordinate2D) {
-        guard var route = inlineEditingRoute else { return }
+        guard !isRouteInteractionLocked,
+              var route = inlineEditingRoute else { return }
         modeManager.addPathPoint(coordinate, to: &route)
         inlineEditingRoute = route
     }
 
     private func handleRouteMapTap(_ coordinate: CLLocationCoordinate2D) {
-        guard !modeManager.isSimulating, !modeManager.isPaused else { return }
+        guard !isRouteInteractionLocked,
+              !modeManager.isSimulating,
+              !modeManager.isPaused else { return }
         if inlineEditingRoute == nil {
             beginInlineRouteCreation()
         }
@@ -793,7 +937,8 @@ struct PathSimulationView: View {
     }
 
     private func confirmFirstRoutePoint() {
-        guard let coordinate = pendingFirstRoutePoint else { return }
+        guard !isRouteInteractionLocked,
+              let coordinate = pendingFirstRoutePoint else { return }
         pendingFirstRoutePoint = nil
         if inlineEditingRoute == nil {
             beginInlineRouteCreation()
@@ -802,7 +947,8 @@ struct PathSimulationView: View {
     }
 
     private func selectRouteStartPoint(_ route: SimulationRoute, index: Int) {
-        guard route.points.indices.contains(index) else { return }
+        guard !isRouteInteractionLocked,
+              route.points.indices.contains(index) else { return }
         startPointByRoute[route.id] = index
         let coordinate = route.points[index].coordinate
         previewStartCoordinate = coordinate
@@ -821,7 +967,8 @@ struct PathSimulationView: View {
         mapPosition = .camera(camera)
         sharedMapState.nativeMapCenterRequest = NativeMapCenterRequest(
             coordinate: coordinate,
-            preserveZoom: true
+            preserveZoom: true,
+            resumesRouteFollowing: true
         )
         SharedNativeMapStore.shared.center(
             at: coordinate,
@@ -843,7 +990,8 @@ struct PathSimulationView: View {
     }
 
     private func saveInlineRoute() {
-        guard var route = inlineEditingRoute else { return }
+        guard !isRouteInteractionLocked,
+              var route = inlineEditingRoute else { return }
         route.name = route.name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard route.isValid, !route.name.isEmpty else { return }
         for index in route.points.indices { route.points[index].order = index }
@@ -875,7 +1023,8 @@ struct PathSimulationView: View {
     }
 
     private func overwritePendingInlineRoute() {
-        guard let route = pendingInlineRouteOverwrite else { return }
+        guard !isRouteInteractionLocked,
+              let route = pendingInlineRouteOverwrite else { return }
         if let editingID = inlineEditingRoute?.id, editingID != route.id,
            let original = modeManager.routes.first(where: { $0.id == editingID }) {
             modeManager.deleteRoute(original)
@@ -885,6 +1034,7 @@ struct PathSimulationView: View {
     }
 
     private func finishSavingInlineRoute(_ route: SimulationRoute) {
+        guard !isRouteInteractionLocked else { return }
         modeManager.saveRoute(route)
         selectedRouteID = route.id
         inlineEditingRoute = nil
@@ -932,6 +1082,7 @@ struct PathSimulationView: View {
     }
 
     private func appendInlineCoordinates() {
+        guard !isRouteInteractionLocked else { return }
         let coordinates = CoordinateImportParser.parseInline(inlineCoordinateText)
         guard var route = inlineEditingRoute else { return }
         for coordinate in coordinates { modeManager.addPathPoint(coordinate, to: &route) }
@@ -951,21 +1102,7 @@ struct PathSimulationView: View {
         case .success(let url):
             do {
                 try PairingFileStore.importFromPicker(url)
-                pairingExists = true
-                isReturningToCurrentLocation = true
-                recenterAfterPairingAuthorization = true
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-                    requestAlwaysPermissionAfterPairingIfNeeded()
-                    currentLocationProvider.requestCurrentLocation(allowCachedLocation: false)
-                }
-
-                if let selected = sharedMapState.selectedCoordinate {
-                    previewStartCoordinate = selected
-                } else if let firstPoint = displayedRoute?.points.first?.coordinate {
-                    previewStartCoordinate = firstPoint
-                } else {
-                    previewStartCoordinate = nil
-                }
+                finishPairingImport()
             } catch {
                 alertMessage = "導入配對文件失敗：\(error.localizedDescription)"
                 showAlert = true
@@ -976,7 +1113,26 @@ struct PathSimulationView: View {
         }
     }
 
+    private func finishPairingImport() {
+        pairingExists = true
+        isReturningToCurrentLocation = true
+        recenterAfterPairingAuthorization = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            requestAlwaysPermissionAfterPairingIfNeeded()
+            currentLocationProvider.requestCurrentLocation(allowCachedLocation: false)
+        }
+
+        if let selected = sharedMapState.selectedCoordinate {
+            previewStartCoordinate = selected
+        } else if let firstPoint = displayedRoute?.points.first?.coordinate {
+            previewStartCoordinate = firstPoint
+        } else {
+            previewStartCoordinate = nil
+        }
+    }
+
     private func startRouteSimulation(_ route: SimulationRoute) {
+        guard !isRouteInteractionLocked else { return }
         // 每次啟動前重新套用設定，避免設定頁與路線引擎狀態不同步。
         applyStoredRouteSettings()
 
@@ -987,11 +1143,6 @@ struct PathSimulationView: View {
             return
         }
 
-        guard pairingExists else {
-            alertMessage = "請先導入配對文件再啟動路線模擬。"
-            showAlert = true
-            return
-        }
         if CLLocationManager().authorizationStatus == .authorizedWhenInUse {
             BackgroundLocationManager.shared.requestAlwaysPermission()
         }
@@ -1000,23 +1151,21 @@ struct PathSimulationView: View {
             showAlert = true
             return
         }
+        guard pairingExists else {
+            alertMessage = "配對文件不存在，請先手動匯入配對文件。"
+            showAlert = true
+            return
+        }
 
         let index = startIndex(for: route)
         guard route.points.indices.contains(index) else { return }
         let coordinate = route.points[index].coordinate
+        routeStartGeneration &+= 1
+        let startGeneration = routeStartGeneration
         isStartingRoute = true
+        sharedMapState.isSimulationTransitioning = true
         let pairingFile = PairingFileStore.prepareURL().path
         let ip = DeviceConnectionContext.targetIPAddress
-
-        // 15 秒 timeout：若裝置無回應，自動解鎖按鈕並提示。
-        let startTimeoutTask = Task { @MainActor in
-            try? await Task.sleep(for: .seconds(15))
-            guard isStartingRoute else { return }
-            isStartingRoute = false
-            guard !shouldReturnToLaunchAfterRouteStart else { return }
-            alertMessage = "連線逾時，請確認裝置已連線並重試。"
-            showAlert = true
-        }
 
         SimulationCoordinator.shared.start(
             mode: .route,
@@ -1025,7 +1174,7 @@ struct PathSimulationView: View {
             pairingFile: pairingFile,
             operation: "啟動路線"
         ) { result in
-            startTimeoutTask.cancel()
+            guard routeStartGeneration == startGeneration else { return }
             isStartingRoute = false
             if shouldReturnToLaunchAfterRouteStart {
                 shouldReturnToLaunchAfterRouteStart = false
@@ -1035,11 +1184,13 @@ struct PathSimulationView: View {
                     stopRouteSimulationNow()
                     finishReturningToLaunchLocation(launchCoordinate, updateHeldRoute: true)
                 } else {
+                    sharedMapState.isSimulationTransitioning = false
                     finishReturningToLaunchLocation(launchCoordinate, updateHeldRoute: false)
                 }
                 return
             }
             guard case .success = result else {
+                sharedMapState.isSimulationTransitioning = false
                 alertMessage = result.failure?.localizedDescription ?? "啟動路線失敗"
                 showAlert = true
                 return
@@ -1053,7 +1204,28 @@ struct PathSimulationView: View {
                 routeName: route.name
             )
             modeManager.startPathSimulation(route: route, speed: simulationSpeed, startIndex: index)
+            // Close the transition only after the shared active state is set;
+            // otherwise tab/search controls can briefly unlock before SwiftUI
+            // observes modeManager.isSimulating.
+            sharedMapState.isSimulationActive = modeManager.isSimulating || modeManager.isPaused
+            sharedMapState.isMovementActive = modeManager.isSimulating && simulationSpeed > 0
+            sharedMapState.isSimulationTransitioning = false
+            pauseFreeRouteForBackgroundIfNeeded()
         }
+    }
+
+    private func pauseFreeRouteForBackgroundIfNeeded() {
+        guard scenePhase == .background,
+              modeManager.isSimulating,
+                            !MembershipFeaturePolicy.canRunRoute(
+                                inBackground: true,
+                                proActive: isProUser
+                            ) else { return }
+
+        routePausedForFreeBackground = true
+        shouldPresentFreeBackgroundPauseAlert = true
+        modeManager.pausePathSimulation()
+        BackgroundLocationManager.shared.requestStop(for: .route)
     }
 
     private func applyStoredRouteSettings() {
@@ -1108,20 +1280,50 @@ struct PathSimulationView: View {
     }
 
     private func sendPendingStoppedRouteCoordinateIfPossible() {
-        guard pairingExists,
-              let coordinate = pendingStoppedRouteCoordinate,
-              !routeLocationCommandInFlight else { return }
+        guard let coordinate = pendingStoppedRouteCoordinate else { return }
+        guard pairingExists else {
+            pendingStoppedRouteCoordinate = nil
+            isReturningStoppedRouteToLaunch = false
+            alertTitle = "路線提示"
+            alertMessage = "路線已停止，但配對文件已不存在；請重新手動匯入配對文件。"
+            showAlert = true
+            finishRouteStoppingIfIdle()
+            return
+        }
+        guard !isRouteLocationCommandInFlight else { return }
         pendingStoppedRouteCoordinate = nil
         pushRouteLocationUpdateIfNeeded(coordinate)
     }
 
     private func stopRouteSimulationNow() {
+        routePausedForFreeBackground = false
+        shouldPresentFreeBackgroundPauseAlert = false
+        routeStartGeneration &+= 1
+        routeLocationCommandGeneration &+= 1
+        routeLocationCommandInFlightGeneration = nil
+        pendingRouteHistoryCoordinate = nil
+        isStartingRoute = false
+        sharedMapState.isSimulationTransitioning = true
+        SimulationCoordinator.shared.invalidatePendingCommands()
         modeManager.stopPathSimulation()
         sharedMapState.isSimulationActive = false
         sharedMapState.isMovementActive = false
         SimulationCoordinator.shared.allowNextModeSwitchWhileHoldingLocation()
         backgroundSimulationManager.markRouteManuallyStoppedHoldingLocation()
         BackgroundLocationManager.shared.requestStart(for: .route)
+        DispatchQueue.main.async {
+            finishRouteStoppingIfIdle()
+        }
+    }
+
+    private func finishRouteStoppingIfIdle() {
+        guard sharedMapState.isSimulationTransitioning,
+              !isStartingRoute,
+              !modeManager.isSimulating,
+              !modeManager.isPaused,
+              !isRouteLocationCommandInFlight,
+              pendingStoppedRouteCoordinate == nil else { return }
+        sharedMapState.isSimulationTransitioning = false
     }
 
     private func pushRouteLocationUpdateIfNeeded(_ location: CLLocationCoordinate2D?) {
@@ -1135,7 +1337,7 @@ struct PathSimulationView: View {
                 || modeManager.isPaused
                 || backgroundSimulationManager.isRouteManuallyStopped,
               let location,
-              !routeLocationCommandInFlight else { return }
+              !isRouteLocationCommandInFlight else { return }
 
         let now = Date()
         if modeManager.isSimulating,
@@ -1143,21 +1345,32 @@ struct PathSimulationView: View {
             return
         }
         lastRoutePushAt = now
-        routeLocationCommandInFlight = true
 
         let pairingFile = PairingFileStore.prepareURL().path
         let ip = DeviceConnectionContext.targetIPAddress
+        let commandGeneration = routeLocationCommandGeneration
+        routeLocationCommandInFlightGeneration = commandGeneration
 
         SimulationCoordinator.shared.update(
             coordinate: location,
             deviceIP: ip,
             pairingFile: pairingFile,
+            intent: .routeMovement,
             operation: "更新路線位置"
         ) { result in
-            routeLocationCommandInFlight = false
+            guard commandGeneration == routeLocationCommandGeneration else {
+                sendPendingStoppedRouteCoordinateIfPossible()
+                finishRouteStoppingIfIdle()
+                return
+            }
+            routeLocationCommandInFlightGeneration = nil
             if pendingStoppedRouteCoordinate != nil {
                 // 房屋停止後以 launch update 收尾；舊 route command 不得回寫舊座標。
                 sendPendingStoppedRouteCoordinateIfPossible()
+                return
+            }
+            if pendingRouteHistoryCoordinate != nil {
+                sendPendingRouteHistoryCoordinateIfPossible()
                 return
             }
             isReturningStoppedRouteToLaunch = false
@@ -1171,6 +1384,67 @@ struct PathSimulationView: View {
                     BackgroundLocationManager.shared.requestStop(for: .route)
                 }
             }
+            finishRouteStoppingIfIdle()
+        }
+    }
+
+    private func handleRouteHistorySelection(_ coordinate: CLLocationCoordinate2D) {
+        guard RouteHistorySelectionPolicy.shouldPauseAndPush(
+            isSimulating: modeManager.isSimulating,
+            isPaused: modeManager.isPaused
+        ) else { return }
+        guard pairingExists else {
+            alertTitle = "路線提示"
+            alertMessage = "配對文件不存在，無法推送歷史座標。"
+            showAlert = true
+            return
+        }
+
+        if modeManager.isSimulating {
+            modeManager.pausePathSimulation()
+        }
+        sharedMapState.isSimulationActive = true
+        sharedMapState.isMovementActive = false
+        pendingRouteHistoryCoordinate = coordinate
+        sendPendingRouteHistoryCoordinateIfPossible()
+    }
+
+    private func sendPendingRouteHistoryCoordinateIfPossible() {
+        guard let coordinate = pendingRouteHistoryCoordinate,
+              !isRouteLocationCommandInFlight else { return }
+        pendingRouteHistoryCoordinate = nil
+
+        let previousCoordinate = modeManager.currentLocation
+        let canResumeRoute = !modeManager.isRouteCompleted
+        let commandGeneration = routeLocationCommandGeneration
+        routeLocationCommandInFlightGeneration = commandGeneration
+        SimulationCoordinator.shared.update(
+            coordinate: coordinate,
+            deviceIP: DeviceConnectionContext.targetIPAddress,
+            pairingFile: PairingFileStore.prepareURL().path,
+            intent: .singlePoint,
+            operation: "推送歷史座標"
+        ) { result in
+            guard commandGeneration == routeLocationCommandGeneration else { return }
+            if case .success = result {
+                modeManager.currentLocation = coordinate
+                sharedMapState.selectedCoordinate = coordinate
+                previewStartCoordinate = coordinate
+                alertTitle = "路線已暫停"
+                alertMessage = canResumeRoute
+                    ? "已推送歷史座標；按播放可繼續原路線。"
+                    : "已推送歷史座標。"
+            } else {
+                if let previousCoordinate {
+                    modeManager.currentLocation = previousCoordinate
+                    sharedMapState.selectedCoordinate = previousCoordinate
+                }
+                alertTitle = "歷史座標推送失敗"
+                alertMessage = result.failure?.localizedDescription
+                    ?? "無法將歷史座標推送到裝置。"
+            }
+            routeLocationCommandInFlightGeneration = nil
+            showAlert = true
         }
     }
 
@@ -1191,7 +1465,8 @@ struct PathSimulationView: View {
         mapPosition = .camera(camera)
         sharedMapState.nativeMapCenterRequest = NativeMapCenterRequest(
             coordinate: coordinate,
-            preserveZoom: true
+            preserveZoom: true,
+            resumesRouteFollowing: true
         )
         SharedNativeMapStore.shared.center(
             at: coordinate,

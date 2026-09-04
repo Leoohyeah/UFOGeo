@@ -22,6 +22,24 @@ enum RouteEditingMapInteractionPolicy {
             && !isSimulationActive
             && !isMapGestureActive
     }
+
+    static func shouldFollowSimulationAfterCenterRequest(
+        isSimulationActive: Bool,
+        requestedCoordinate: CLLocationCoordinate2D,
+        simulatedCoordinate: CLLocationCoordinate2D?,
+        resumesRouteFollowing: Bool
+    ) -> Bool {
+        if resumesRouteFollowing { return true }
+        guard isSimulationActive,
+              let simulatedCoordinate else { return true }
+        return CLLocation(
+            latitude: requestedCoordinate.latitude,
+            longitude: requestedCoordinate.longitude
+        ).distance(from: CLLocation(
+            latitude: simulatedCoordinate.latitude,
+            longitude: simulatedCoordinate.longitude
+        )) <= 0.01
+    }
 }
 
 struct RouteEditingMapView: UIViewRepresentable {
@@ -100,6 +118,7 @@ struct RouteEditingMapView: UIViewRepresentable {
             context.coordinator.invalidateRouteSnapshot()
         }
         context.coordinator.updateCameraInteraction(on: mapView)
+        context.coordinator.applyPendingCenterRequest(on: mapView)
         guard !context.coordinator.isDraggingPoint else { return }
         // 若路線已切換（snapshot 被清除），即使手勢仍在也要立即更新路點。
         let needsForceInstall = context.coordinator.needsForceInstall
@@ -143,6 +162,8 @@ struct RouteEditingMapView: UIViewRepresentable {
         private var routeOverlay: LiveRouteOverlay?
         private weak var routeRenderer: LiveRouteOverlayRenderer?
         private var lastFollowedCoordinate: CLLocationCoordinate2D?
+        private var appliedCenterRequestID: UUID?
+        private var followsSimulation = true
         private var routeSnapshot: RouteSnapshot?
 
         private struct RouteSnapshot: Equatable {
@@ -211,6 +232,24 @@ struct RouteEditingMapView: UIViewRepresentable {
             mapView.isZoomEnabled = !simulating
             mapView.isScrollEnabled = !simulating
             mapView.isRotateEnabled = !simulating
+        }
+
+        func applyPendingCenterRequest(on mapView: MKMapView) {
+            guard let request = parent.sharedMapState.nativeMapCenterRequest,
+                  request.id != appliedCenterRequestID else { return }
+            appliedCenterRequestID = request.id
+            SharedNativeMapStore.shared.center(
+                at: request.coordinate,
+                preserveZoom: request.preserveZoom
+            )
+
+            followsSimulation = RouteEditingMapInteractionPolicy
+                .shouldFollowSimulationAfterCenterRequest(
+                    isSimulationActive: parent.sharedMapState.isSimulationActive,
+                    requestedCoordinate: request.coordinate,
+                    simulatedCoordinate: parent.simulatedCoordinate,
+                    resumesRouteFollowing: request.resumesRouteFollowing
+                )
         }
 
         func installRoute(on mapView: MKMapView) {
@@ -622,6 +661,9 @@ struct RouteEditingMapView: UIViewRepresentable {
         }
 
         private func updateSimulationMarker(on mapView: MKMapView) {
+            if !parent.sharedMapState.isSimulationActive {
+                followsSimulation = true
+            }
             let existing = mapView.annotations.compactMap {
                 $0 as? RouteSimulationMapAnnotation
             }
@@ -658,6 +700,7 @@ struct RouteEditingMapView: UIViewRepresentable {
                 configureSimulationInteraction(for: view)
             }
             if parent.isSimulationMoving,
+                    followsSimulation,
                !isMapInteractionOngoing(on: mapView),
                shouldFollow(coordinate) {
                 lastFollowedCoordinate = coordinate

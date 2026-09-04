@@ -3,7 +3,7 @@ import Foundation
 
 extension Notification.Name {
     static let locationBookmarksDidChange = Notification.Name(
-        "com.ufogo.location-bookmarks-did-change"
+        "com.ufogeo.location-bookmarks-did-change"
     )
 }
 
