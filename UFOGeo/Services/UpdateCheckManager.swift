@@ -13,7 +13,7 @@ final class UpdateCheckManager: ObservableObject {
     }
 
     private let repositoryOwner = "Leoohyeah"
-    private let repositoryName = "UFOGeo-Health"
+    private let repositoryName = "UFOGeo"
     private let checkInterval: TimeInterval = 86400 // 24小時檢查一次
     private var cancellables = Set<AnyCancellable>()
 
@@ -96,7 +96,7 @@ final class UpdateCheckManager: ObservableObject {
 
     /// 打開更新頁面
     func openUpdatePage() {
-        guard let url = URL(string: "https://github.com/\(repositoryOwner)/\(repositoryName)/releases") else {
+        guard let url = URL(string: "sidestore://install?url=https://github.com/Leoohyeah/UFOGeo/releases/latest/download/UFOGeo.ipa") else {
             return
         }
         UIApplication.shared.open(url)

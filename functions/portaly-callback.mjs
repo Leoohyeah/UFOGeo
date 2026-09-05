@@ -16,6 +16,8 @@ const SUPPORTED_EVENTS = new Set([
   "creator_subscription.checkout.failed",
   "creator_subscription.payment.succeeded",
   "creator_subscription.payment.failed",
+  "creator_subscription.payment.refunded",
+  "creator_subscription.payment.refund_failed",
   "creator_subscription.active",
   "creator_subscription.cancel_requested",
   "creator_subscription.canceled",
@@ -43,6 +45,66 @@ function requiredPayloadString(payload, field) {
   const value = nonBlankString(payload?.[field]);
   if (!value) throw new CallbackError(400, `Callback ${field} is missing`);
   return value;
+}
+
+function requiredPayloadTimestamp(payload, field) {
+  const value = requiredPayloadString(payload, field);
+  if (!Number.isFinite(strictIsoTimestampMs(value))) {
+    throw new CallbackError(422, `Callback ${field} is invalid`);
+  }
+  return value;
+}
+
+function requiredPayloadBoolean(payload, field) {
+  if (typeof payload?.[field] !== "boolean") {
+    throw new CallbackError(422, `Callback ${field} is invalid`);
+  }
+  return payload[field];
+}
+
+function requiredPayloadNumber(payload, field) {
+  const value = payload?.[field];
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    throw new CallbackError(422, `Callback ${field} is invalid`);
+  }
+  return value;
+}
+
+function requiredNullablePayloadString(payload, field) {
+  if (payload?.[field] === null) return null;
+  return requiredPayloadString(payload, field);
+}
+
+function requiredNullablePayloadBoolean(payload, field) {
+  if (payload?.[field] === null) return null;
+  return requiredPayloadBoolean(payload, field);
+}
+
+function validateRefundSharedFields(payload) {
+  requiredPayloadString(payload, "subscriptionId");
+  const orderId = requiredPayloadString(payload, "orderId");
+  validateDocumentIdentifier(orderId, "orderId");
+
+  requiredPayloadString(payload, "paymentId");
+  requiredPayloadString(payload, "paymentReference");
+  requiredPayloadString(payload, "orderMerchantOrderNumber");
+
+  const amount = requiredPayloadNumber(payload, "amount");
+  const refundedAmount = requiredPayloadNumber(payload, "refundedAmount");
+  requiredPayloadString(payload, "currency");
+  const refundRequestedAt = requiredPayloadTimestamp(payload, "refundRequestedAt");
+  requiredPayloadString(payload, "refundRequestedBy");
+  requiredPayloadString(payload, "refundReason");
+  requiredNullablePayloadString(payload, "refundReasonNote");
+  requiredPayloadString(payload, "refundProvider");
+  requiredPayloadBoolean(payload, "subscriptionCanceledByRefund");
+
+  return {
+    orderId,
+    amount,
+    refundedAmount,
+    refundRequestedAtMs: strictIsoTimestampMs(refundRequestedAt),
+  };
 }
 
 function validateDocumentIdentifier(value, field) {
@@ -108,7 +170,7 @@ export function verifyCallbackEnvelope({headers, payload, secret, now = Date.now
 
 /**
  * Validates the signed event body before it is allowed to select or mutate a
- * Firestore document. These checks mirror Portaly Payment 0.10.0's event
+ * Firestore document. These checks mirror Portaly Payment 0.11.2's event
  * contract and deliberately fail closed when identities conflict.
  */
 export function validateCallbackPayload(event, payload) {
@@ -159,6 +221,30 @@ export function validateCallbackPayload(event, payload) {
       throw new CallbackError(422, "Failed payment callback has an invalid status");
     }
     break;
+  case "creator_subscription.payment.refunded":
+    {
+      const refundFields = validateRefundSharedFields(payload);
+      const refundedAt = requiredPayloadTimestamp(payload, "refundedAt");
+      if (strictIsoTimestampMs(refundedAt) < refundFields.refundRequestedAtMs) {
+        throw new CallbackError(422, "Refund callback timestamps are out of order");
+      }
+      if (refundFields.amount !== refundFields.refundedAmount) {
+        throw new CallbackError(422, "Refund callback amounts do not match");
+      }
+    }
+    requiredPayloadString(payload, "refundReference");
+    break;
+  case "creator_subscription.payment.refund_failed":
+    {
+      const refundFields = validateRefundSharedFields(payload);
+      const refundFailedAt = requiredPayloadTimestamp(payload, "refundFailedAt");
+      if (strictIsoTimestampMs(refundFailedAt) < refundFields.refundRequestedAtMs) {
+        throw new CallbackError(422, "Refund callback timestamps are out of order");
+      }
+    }
+    requiredPayloadString(payload, "refundFailureReason");
+    requiredNullablePayloadBoolean(payload, "refundFailureRetryable");
+    break;
   case "creator_subscription.active":
   case "creator_subscription.cancel_requested":
   case "creator_subscription.canceled":
@@ -182,6 +268,11 @@ export function eventIdentity(payload) {
     const paymentIdentity = nonBlankString(payload.paymentId) ||
       nonBlankString(payload.paymentReference);
     return paymentIdentity ? `${canonicalEventName(payload.event)}:${paymentIdentity}` : null;
+  }
+  case "creator_subscription.payment.refunded":
+  case "creator_subscription.payment.refund_failed": {
+    const orderId = nonBlankString(payload.orderId);
+    return orderId ? `${canonicalEventName(payload.event)}:${orderId}` : null;
   }
   default:
     return null;

@@ -6,6 +6,17 @@
 	<string>$(FIREBASE_WEB_API_KEY)</string>
 	<key>PortalyBackendURL</key>
 	<string>$(PORTALY_BACKEND_URL)</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>ufogeo</string>
+			</array>
+		</dict>
+	</array>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>location</string>

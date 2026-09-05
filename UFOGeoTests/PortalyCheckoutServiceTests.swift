@@ -84,6 +84,40 @@ struct PortalyCheckoutServiceTests {
         )
     }
 
+    @Test func portalyReturnParserAcceptsOnlySupportedFlows() throws {
+        let supported: [(String, PortalyCheckoutService.PortalyReturnFlow)] = [
+            ("ufogeo://portaly-return?flow=checkout", .checkout),
+            ("ufogeo://portaly-return?flow=portal", .portal)
+        ]
+        for (rawURL, expectedFlow) in supported {
+            let url = try #require(URL(string: rawURL))
+            #expect(
+                PortalyCheckoutService.portalyReturnFlow(from: url) == expectedFlow,
+                "應接受合法 Portaly return URL：\(rawURL)"
+            )
+        }
+
+        let rejected = [
+            "http://portaly-return?flow=checkout",
+            "https://portaly-return?flow=checkout",
+            "ufogeo://wrong-host?flow=checkout",
+            "ufogeo://portaly-return",
+            "ufogeo://portaly-return?flow=unknown",
+            "ufogeo://portaly-return?flow=checkout&flow=portal",
+            "ufogeo://user@portaly-return?flow=checkout",
+            "ufogeo://portaly-return:443?flow=checkout",
+            "ufogeo://portaly-return/path?flow=checkout",
+            "ufogeo://portaly-return?flow=checkout#fragment"
+        ]
+        for rawURL in rejected {
+            let url = try #require(URL(string: rawURL))
+            #expect(
+                PortalyCheckoutService.portalyReturnFlow(from: url) == nil,
+                "不應接受非契約 URL：\(rawURL)"
+            )
+        }
+    }
+
     @Test func accountDeletionSafetyErrorsPreserveBackendChineseMessage() {
         #expect(
             PortalyCheckoutService.serverErrorMessage(
@@ -197,7 +231,7 @@ struct PortalyCheckoutServiceTests {
     @Test func subscriptionStateUsesLegacyFreeFallbackWhenSourceIsMissing() throws {
         let data = Data(
             """
-            {"uid":"uid-1","email":"member@example.com","emailVerified":true,"proActive":false,"subscriptionStatus":"none","subscriptionId":null,"planId":"plan-1","mode":null,"nextBillingAt":null,"cancelAtPeriodEnd":false,"cancelEffectiveAt":null}
+            {"uid":"uid-1","email":"member@example.com","emailVerified":true,"proActive":false,"subscriptionStatus":"none","subscriptionId":null,"planId":"\(PortalyCheckoutService.expectedPlanID)","mode":"test","nextBillingAt":null,"cancelAtPeriodEnd":false,"cancelEffectiveAt":null}
             """.utf8
         )
         let decoded = try JSONDecoder().decode(
@@ -215,7 +249,7 @@ struct PortalyCheckoutServiceTests {
     @Test func subscriptionStateUsesLegacyPortalyFallbackWhenSourceIsMissing() throws {
         let data = Data(
             """
-            {"uid":"uid-1","email":"member@example.com","emailVerified":true,"proActive":true,"subscriptionStatus":"active","subscriptionId":"sub-legacy","planId":"plan-1","mode":"test","nextBillingAt":null,"cancelAtPeriodEnd":false,"cancelEffectiveAt":null}
+            {"uid":"uid-1","email":"member@example.com","emailVerified":true,"proActive":true,"subscriptionStatus":"active","subscriptionId":"sub-legacy","planId":"\(PortalyCheckoutService.expectedPlanID)","mode":"test","nextBillingAt":null,"cancelAtPeriodEnd":false,"cancelEffectiveAt":null}
             """.utf8
         )
         let decoded = try JSONDecoder().decode(
@@ -511,7 +545,7 @@ struct PortalyCheckoutServiceTests {
         }
     }
 
-    @Test func uidMismatchAndExpiredCacheFailClosedBeforeProjectingPro() throws {
+    @Test @MainActor func uidMismatchAndExpiredCacheFailClosedBeforeProjectingPro() throws {
         let now = try #require(
             ISO8601DateFormatter().date(from: "2026-09-04T00:00:00Z")
         )

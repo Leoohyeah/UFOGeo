@@ -87,7 +87,7 @@ const PROJECT_ID = "ufogeo-adac7";
 const PUBLIC_BASE_URL = `https://${PROJECT_ID}.web.app`;
 const SUPPORT_EMAIL = "leoohyeah.app@gmail.com";
 const PORTALY_PLAN_ID = "JO5cmDQdqTtb6AkkcnNW";
-const PORTALY_SKILL_VERSION = "0.10.0";
+const PORTALY_SKILL_VERSION = "0.11.2";
 const API_HOST = (process.env.PORTALY_API_HOST || "https://portaly.ai").replace(/\/$/, "");
 const MAX_BODY_BYTES = 128 * 1024;
 const CHECKOUT_LEASE_MS = 60 * 1000;
@@ -2158,6 +2158,8 @@ async function processCallback(request, response) {
   const expectedMode = requirePortalyMode(PORTALY_API_KEY.value());
 
   const isCheckoutFailure = event === "creator_subscription.checkout.failed";
+  const isRefundEvent = event === "creator_subscription.payment.refunded" ||
+    event === "creator_subscription.payment.refund_failed";
   const sessionRef = db.collection("checkoutSessions").doc(callbackIdentifier);
   const identity = eventIdentity(payload);
   const eventRef = identity ? db.collection("portalyEvents").doc(
@@ -2181,6 +2183,59 @@ async function processCallback(request, response) {
     }
     const lockPlanId = payload.planId || session.planId;
     const callbackMode = payload.mode || session.mode;
+    // Refund outcomes are payment-order facts, not subscription state.  They
+    // must be acknowledged and audited independently because Portaly may
+    // deliver them before or after a separate canceled callback.
+    if (isRefundEvent) {
+      if (!eventRef) {
+        throw new CallbackError(400, "Refund callback has no order identity");
+      }
+      if (eventSnapshot?.exists) {
+        return {duplicate: true};
+      }
+      const receivedAt = FieldValue.serverTimestamp();
+      const orderId = payload.orderId.trim();
+      transaction.create(eventRef, {
+        identity,
+        event,
+        sessionId: payload.sessionId || callbackIdentifier,
+        subscriptionId: payload.subscriptionId || callbackIdentifier,
+        orderId,
+        paymentId: payload.paymentId || null,
+        paymentReference: payload.paymentReference || null,
+        mode: payload.mode || session.mode || null,
+        receivedAt: verified.timestamp,
+      });
+      transaction.create(db.collection("portalyAudit").doc(), compact({
+        uid: session.uid,
+        event,
+        orderId,
+        sessionId: payload.sessionId || callbackIdentifier,
+        subscriptionId: payload.subscriptionId || callbackIdentifier,
+        planId: payload.planId || session.planId || null,
+        merchantOrderNumber: payload.orderMerchantOrderNumber ||
+          session.merchantOrderNumber || null,
+        paymentId: payload.paymentId || null,
+        paymentReference: payload.paymentReference || null,
+        amount: payload.amount,
+        currency: payload.currency,
+        refundedAmount: payload.refundedAmount,
+        refundRequestedAt: payload.refundRequestedAt,
+        refundRequestedBy: payload.refundRequestedBy,
+        refundReason: payload.refundReason,
+        refundReasonNote: payload.refundReasonNote,
+        refundProvider: payload.refundProvider,
+        refundReference: payload.refundReference,
+        refundedAt: payload.refundedAt,
+        refundFailedAt: payload.refundFailedAt,
+        refundFailureReason: payload.refundFailureReason,
+        refundFailureRetryable: payload.refundFailureRetryable,
+        subscriptionCanceledByRefund: payload.subscriptionCanceledByRefund,
+        mode: callbackMode || null,
+        receivedAt,
+      }));
+      return {duplicate: false, refundOnly: true};
+    }
     const callbackMatchesDeployment = callbackModeMatchesDeployment(
       callbackMode,
       expectedMode,

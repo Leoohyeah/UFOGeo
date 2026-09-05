@@ -41,7 +41,6 @@ struct MainTabView: View {
                 switch phase {
                 case .active:
                     handleAppBecameActive()
-                    refreshMembershipEntitlement()
                 case .background:
                     stopMembershipRefreshLoop()
                     recordNoSimulationBackgroundIfNeeded()
@@ -55,6 +54,9 @@ struct MainTabView: View {
             }
             .onDisappear {
                 stopMembershipRefreshLoop()
+            }
+            .onOpenURL { url in
+                portaly.handlePortalyReturnURL(url)
             }
             .task(id: auth.session?.uid) {
                 stopMembershipRefreshLoop()
@@ -224,20 +226,9 @@ struct MainTabView: View {
         switchToActiveSimulationTabIfNeeded()
     }
 
-    private func refreshMembershipEntitlement() {
-        guard auth.isSignedIn else {
-            stopMembershipRefreshLoop()
-            return
-        }
-        Task {
-            await synchronizeMembershipEntitlement(forceRefresh: false)
-            startMembershipRefreshLoopIfNeeded()
-        }
-    }
-
     private func synchronizeMembershipEntitlement(forceRefresh: Bool) async {
-        // The service serializes portal reconciliation and the single forced
-        // refresh required after returning from either hosted flow.
+        // The service performs the initial/session sync. Portaly callbacks are
+        // handled separately by the deep-link queue.
         try? await portaly.synchronizeOnForeground(forceRefresh: forceRefresh)
     }
 

@@ -693,6 +693,36 @@ final class PortalyCheckoutService: ObservableObject {
         MembershipFeaturePolicy.canRunRoute(inBackground: true, proActive: isPro)
     }
 
+    /// Accept only the app-owned Portaly return contract.  The callback is a
+    /// signal to refresh server state; it never carries identity or payment
+    /// data and is never treated as proof of entitlement by itself.
+    nonisolated static func portalyReturnFlow(from url: URL) -> PortalyReturnFlow? {
+        guard url.scheme == "ufogeo",
+              url.host == "portaly-return",
+              url.user == nil,
+              url.password == nil,
+              url.port == nil,
+              url.path.isEmpty,
+              url.fragment == nil,
+              !url.absoluteString.contains("#"),
+              let components = URLComponents(
+                  url: url,
+                  resolvingAgainstBaseURL: false
+              ),
+              components.scheme == "ufogeo",
+              components.host == "portaly-return",
+              components.path.isEmpty,
+              components.fragment == nil,
+              let queryItems = components.queryItems,
+              queryItems.count == 1,
+              let flowItem = queryItems.first,
+              flowItem.name == "flow",
+              let value = flowItem.value else {
+            return nil
+        }
+        return PortalyReturnFlow(rawValue: value)
+    }
+
     @discardableResult
     func refreshProEntitlementIfNeeded() async -> Bool {
         guard isPro else { return false }
@@ -771,6 +801,11 @@ final class PortalyCheckoutService: ObservableObject {
         let cachedAt: Date
     }
 
+    enum PortalyReturnFlow: String, Equatable {
+        case checkout
+        case portal
+    }
+
     nonisolated private static let cacheLifetime: TimeInterval = 24 * 60 * 60
     nonisolated static let entitlementRefreshInterval: TimeInterval = 15 * 60
     private static let keychainService = "tw.ufogeo.subscription"
@@ -783,7 +818,10 @@ final class PortalyCheckoutService: ObservableObject {
     private var reconciliationInFlightID: UUID?
     private var foregroundSyncTask: Task<Void, Error>?
     private var foregroundSyncID: UUID?
-    private var checkoutReturnUID: String?
+    private var portalyReturnQueue: [PortalyReturnFlow] = []
+    private var portalyReturnRetryQueue: [PortalyReturnFlow] = []
+    private var portalyReturnProcessorTask: Task<Void, Never>?
+    private var portalyReturnProcessorID: UUID?
     private var subscriptionRefreshTask: Task<SubscriptionState, Error>?
     private var subscriptionRefreshID: UUID?
     private var entitlementValidatedAt: Date?
@@ -886,7 +924,6 @@ final class PortalyCheckoutService: ObservableObject {
             throw CheckoutError.invalidResponse
         }
         shouldKeepCheckoutLock = true
-        checkoutReturnUID = uid
         return response.checkoutUrl
     }
 
@@ -902,7 +939,6 @@ final class PortalyCheckoutService: ObservableObject {
             method: "POST"
         )
         guard response.portalUrl.scheme == "https" else { throw CheckoutError.invalidResponse }
-        setReconcileMarker(true)
         return response.portalUrl
     }
 
@@ -977,9 +1013,9 @@ final class PortalyCheckoutService: ObservableObject {
     /// reads Firestore and may therefore return the state that existed before
     /// Portaly processed a resume request.
     @discardableResult
-    func reconcileSubscriptionIfNeeded() async throws -> SubscriptionState? {
+    func reconcileSubscriptionIfNeeded(force: Bool = false) async throws -> SubscriptionState? {
         loadReconcileMarkerIfNeeded()
-        guard needsSubscriptionReconcile else { return nil }
+        guard force || needsSubscriptionReconcile else { return nil }
         guard let reconciliationUID = authService.session?.uid else { return nil }
         guard reconciliationInFlightID == nil else { return nil }
 
@@ -1052,42 +1088,116 @@ final class PortalyCheckoutService: ObservableObject {
         return subscription
     }
 
-    func synchronizeOnForeground(forceRefresh: Bool = false) async throws {
+    func synchronizeOnForeground(
+        forceRefresh: Bool = false,
+        forceReconcile: Bool? = nil
+    ) async throws {
+        startPortalyReturnProcessorIfNeeded()
         if let foregroundSyncTask {
             return try await foregroundSyncTask.value
         }
 
         loadReconcileMarkerIfNeeded()
         guard let uid = authService.session?.uid else { return }
-        let shouldReconcile = needsSubscriptionReconcile
+        let shouldReconcile = forceReconcile ?? (needsSubscriptionReconcile && forceRefresh)
         guard Self.shouldSynchronizeOnForeground(
             subscription: subscription?.uid == uid ? subscription : nil,
             needsReconcile: shouldReconcile,
-            needsCheckoutRefresh: forceRefresh || checkoutReturnUID == uid
+            needsCheckoutRefresh: forceRefresh
         ) else { return }
 
         let operationID = UUID()
         let task = Task { @MainActor in
+            defer {
+                // Clear the shared task before this task becomes observable as
+                // completed so a queued callback can start its own sync.
+                if foregroundSyncID == operationID {
+                    foregroundSyncTask = nil
+                    foregroundSyncID = nil
+                }
+            }
             if shouldReconcile {
-                _ = try await reconcileSubscriptionIfNeeded()
+                _ = try await reconcileSubscriptionIfNeeded(force: true)
             }
             _ = try await refreshSubscription(force: true)
             guard authService.session?.uid == uid else {
                 throw CancellationError()
             }
-            if checkoutReturnUID == uid {
-                checkoutReturnUID = nil
-            }
         }
         foregroundSyncID = operationID
         foregroundSyncTask = task
-        defer {
-            if foregroundSyncID == operationID {
-                foregroundSyncTask = nil
-                foregroundSyncID = nil
+        try await task.value
+    }
+
+    /// Receive only an app-owned Portaly deep-link callback. Each accepted
+    /// callback is queued, so rapid returns cannot be dropped or overlap.
+    func handlePortalyReturnURL(_ url: URL) {
+        guard let flow = Self.portalyReturnFlow(from: url) else { return }
+        if !portalyReturnRetryQueue.isEmpty {
+            portalyReturnQueue.insert(contentsOf: portalyReturnRetryQueue, at: 0)
+            portalyReturnRetryQueue.removeAll(keepingCapacity: true)
+        }
+        portalyReturnQueue.append(flow)
+        startPortalyReturnProcessorIfNeeded()
+    }
+
+    private func startPortalyReturnProcessorIfNeeded() {
+        guard portalyReturnProcessorTask == nil,
+              !portalyReturnQueue.isEmpty,
+              authService.session?.uid != nil else { return }
+
+        let processorID = UUID()
+        let task = Task { @MainActor in
+            defer {
+                if portalyReturnProcessorID == processorID {
+                    portalyReturnProcessorTask = nil
+                    portalyReturnProcessorID = nil
+                    // Callbacks received while this batch was awaiting the
+                    // server are handled by a fresh task. Failed items remain
+                    // in the retry queue until another explicit callback
+                    // arrives.
+                    if authService.session?.uid != nil,
+                       !portalyReturnQueue.isEmpty {
+                        startPortalyReturnProcessorIfNeeded()
+                    }
+                }
+            }
+
+            let batch = portalyReturnQueue
+            portalyReturnQueue.removeAll(keepingCapacity: true)
+            for flow in batch {
+                do {
+                    try await synchronizeAfterPortalyReturn(flow)
+                } catch {
+                    // A failed callback is retained for an explicit retry;
+                    // do not spin on a failing network request.
+                    guard portalyReturnProcessorID == processorID else { return }
+                    portalyReturnRetryQueue.append(flow)
+                }
             }
         }
-        try await task.value
+        portalyReturnProcessorID = processorID
+        portalyReturnProcessorTask = task
+    }
+
+    private func synchronizeAfterPortalyReturn(_ flow: PortalyReturnFlow) async throws {
+        guard authService.session?.uid != nil else {
+            throw CheckoutError.server("請先登入 UFOGeo 帳號後再試。")
+        }
+        if flow == .portal {
+            // Only an explicit portal callback creates the reconcile marker.
+            setReconcileMarker(true)
+        }
+        // Wait for an initial/session refresh already in flight, then run the
+        // callback's own forced request. This preserves checkout GET-only and
+        // portal POST-then-GET semantics.
+        if let foregroundSyncTask {
+            try await foregroundSyncTask.value
+        }
+        try await synchronizeOnForeground(
+            forceRefresh: true,
+            forceReconcile: flow == .portal
+        )
     }
 
     func clearLocalState() {
@@ -1099,7 +1209,11 @@ final class PortalyCheckoutService: ObservableObject {
         foregroundSyncTask?.cancel()
         foregroundSyncTask = nil
         foregroundSyncID = nil
-        checkoutReturnUID = nil
+        portalyReturnProcessorTask?.cancel()
+        portalyReturnProcessorTask = nil
+        portalyReturnProcessorID = nil
+        portalyReturnQueue.removeAll()
+        portalyReturnRetryQueue.removeAll()
         subscriptionRefreshTask?.cancel()
         subscriptionRefreshTask = nil
         subscriptionRefreshID = nil
