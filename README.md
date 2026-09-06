@@ -38,7 +38,7 @@ UFOGeo 是一款面向 iOS 裝置開發與測試場景的定位模擬與路線�
 1. 電腦請先安裝對應的 iLoader
 2. 安裝後打開 iLoader
 3. 登入 Apple ID，並與 iPhone 完成配對
-4. 在 iLoader 中選擇安裝 SideStore (穩定 or 每夜建置 擇一)
+4. 在 iLoader 中選擇安裝 SideStore (每夜建置)
 
 ### 3. 安裝 UFOGeo IPA
 
