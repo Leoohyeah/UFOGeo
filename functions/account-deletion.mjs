@@ -2,6 +2,7 @@ import {
   hasActiveCheckoutSafetyHold,
   isReusableCheckoutSession,
 } from "./checkout-idempotency.mjs";
+import {RECOVERY_LOCK_STATUS} from "./subscription-recovery.mjs";
 
 const ACTIVE_SUBSCRIPTION_STATUSES = new Set([
   "active",
@@ -299,6 +300,12 @@ export function accountDeletionGuardDecision({
   // does not bypass a hold, which also protects an immediately re-registered
   // account using the same verified email.
   for (const lock of locks) {
+    if (lock?.status === RECOVERY_LOCK_STATUS) {
+      const leaseExpiresAtMs = Number(lock.leaseExpiresAtMs);
+      if (!Number.isFinite(leaseExpiresAtMs) || leaseExpiresAtMs > now) {
+        return {kind: "safety_hold"};
+      }
+    }
     if (hasActiveCheckoutSafetyHold(scoped(lock), {planId, mode, now})) {
       return {kind: "safety_hold"};
     }

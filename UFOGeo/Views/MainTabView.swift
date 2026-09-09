@@ -41,6 +41,9 @@ struct MainTabView: View {
                 switch phase {
                 case .active:
                     handleAppBecameActive()
+                    Task {
+                        await synchronizeEntitlementOnForegroundIfNeeded()
+                    }
                 case .background:
                     stopMembershipRefreshLoop()
                     recordNoSimulationBackgroundIfNeeded()
@@ -230,6 +233,71 @@ struct MainTabView: View {
         // The service performs the initial/session sync. Portaly callbacks are
         // handled separately by the deep-link queue.
         try? await portaly.synchronizeOnForeground(forceRefresh: forceRefresh)
+    }
+
+    private func synchronizeEntitlementOnForegroundIfNeeded() async {
+        guard auth.isSignedIn else { return }
+        
+        // 記錄快取新鮮度和同步狀態（用於 debug）
+        let isCacheExpired = portaly.isEntitlementCacheExpired
+        let needsReconcile = portaly.needsSubscriptionReconcile
+        
+        #if DEBUG
+        print("[MainTabView] 快取同步檢查：isExpired=\(isCacheExpired), needsReconcile=\(needsReconcile)")
+        #endif
+        
+        // 計算是否應該強制查 Firebase
+        // 條件：快取已過期 OR 有待 reconcile 標記 OR 有待支付狀態
+        let shouldForceRefresh = isCacheExpired || needsReconcile
+        
+        // 實現指數退避重試機制（最多 3 次）
+        var retryCount = 0
+        let maxRetries = 3
+        var lastError: Error?
+        
+        while retryCount < maxRetries {
+            do {
+                #if DEBUG
+                if retryCount > 0 {
+                    print("[MainTabView] 重試快取同步 (嘗試 \(retryCount + 1)/\(maxRetries))")
+                }
+                #endif
+                
+                try await portaly.synchronizeOnForeground(
+                    forceRefresh: shouldForceRefresh,
+                    forceReconcile: needsReconcile
+                )
+                
+                #if DEBUG
+                print("[MainTabView] 快取同步成功")
+                #endif
+                return  // 成功，退出
+            } catch {
+                lastError = error
+                retryCount += 1
+                
+                #if DEBUG
+                print("[MainTabView] 快取同步失敗 (嘗試 \(retryCount)): \(error.localizedDescription)")
+                #endif
+                
+                if retryCount < maxRetries {
+                    // 指數退避：100ms, 200ms, 400ms
+                    let delaySeconds: TimeInterval = pow(2.0, Double(retryCount - 1)) * 0.1
+                    try? await Task.sleep(nanoseconds: UInt64(delaySeconds * 1_000_000_000))
+                }
+            }
+        }
+        
+        // 重試全部失敗後的錯誤恢復
+        if let error = lastError {
+            #if DEBUG
+            print("[MainTabView] 快取同步最終失敗，保留現有快取狀態: \(error.localizedDescription)")
+            #endif
+            
+            // 若快取新鮮（或非過期），則保留現有快取，不將其置為 nil
+            // 若快取已過期，則允許同步失敗（保留過期狀態以供下次嘗試）
+            // 這樣避免了因為暫時網路故障導致的快取丟失
+        }
     }
 
     private var isForegroundProFeatureActive: Bool {

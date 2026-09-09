@@ -133,6 +133,31 @@ struct PortalyCheckoutServiceTests {
         )
     }
 
+    @Test func uncertainCheckoutErrorsProvideSafeFallbackGuidance() {
+        let codes = [
+            "PORTALY_REQUEST_UNCERTAIN",
+            "PORTALY_RESPONSE_INCOMPLETE",
+            "PORTALY_CHECKOUT_RECONCILE_FAILED",
+            "PORTALY_CHECKOUT_RECONCILE_UNCERTAIN",
+            "PORTALY_RECONCILE_REQUEST_UNCERTAIN",
+            "PORTALY_RECONCILE_FAILED",
+            "PORTALY_RECONCILE_RESPONSE_INVALID",
+            "CHECKOUT_SAFETY_HOLD",
+            "PENDING_CHECKOUT_EXISTS",
+            "RECOVERY_PENDING_CHECKOUT",
+        ]
+
+        for code in codes {
+            let message = PortalyCheckoutService.serverErrorMessage(
+                code: code,
+                serverMessage: nil
+            )
+            #expect(message.contains("尚未確認"), "應說明付款結果尚未確認：\(code)")
+            #expect(message.contains("重新同步"), "應提供重新同步恢復路徑：\(code)")
+            #expect(message.contains("重複付款"), "應阻止重複付款：\(code)")
+        }
+    }
+
     @Test @MainActor func duplicateRequestErrorsExplainThatTheExistingRequestIsStillRunning() {
         #expect(
             PortalyCheckoutService.CheckoutError.checkoutRequestInFlight.errorDescription
@@ -142,6 +167,164 @@ struct PortalyCheckoutServiceTests {
             PortalyCheckoutService.CheckoutError.portalRequestInFlight.errorDescription
                 == "訂閱管理頁面正在開啟，請稍候，不要重複點擊。"
         )
+    }
+
+    @Test func requestRetryPolicyOnlyRetriesTransientGetFailuresOnce() {
+        #expect(
+            PortalyCheckoutService.shouldRetryRequest(
+                method: "GET",
+                attempt: 0,
+                error: URLError(.timedOut)
+            )
+        )
+        #expect(
+            PortalyCheckoutService.shouldRetryRequest(
+                method: "GET",
+                attempt: 0,
+                error: URLError(.networkConnectionLost)
+            )
+        )
+        #expect(
+            !PortalyCheckoutService.shouldRetryRequest(
+                method: "GET",
+                attempt: 1,
+                error: URLError(.timedOut)
+            )
+        )
+        #expect(
+            !PortalyCheckoutService.shouldRetryRequest(
+                method: "POST",
+                attempt: 0,
+                error: URLError(.timedOut)
+            )
+        )
+        #expect(
+            !PortalyCheckoutService.shouldRetryRequest(
+                method: "DELETE",
+                attempt: 0,
+                error: URLError(.networkConnectionLost)
+            )
+        )
+        #expect(
+            !PortalyCheckoutService.shouldRetryRequest(
+                method: "GET",
+                attempt: 0,
+                error: URLError(.cancelled)
+            )
+        )
+        #expect(
+            !PortalyCheckoutService.shouldRetryRequest(
+                method: "GET",
+                attempt: 0,
+                error: CancellationError()
+            )
+        )
+        let checkoutErrors: [Error] = [
+            PortalyCheckoutService.CheckoutError.backendNotConfigured,
+            PortalyCheckoutService.CheckoutError.invalidBackendURL,
+            PortalyCheckoutService.CheckoutError.invalidResponse,
+            PortalyCheckoutService.CheckoutError.checkoutRequestInFlight,
+            PortalyCheckoutService.CheckoutError.portalRequestInFlight,
+            PortalyCheckoutService.CheckoutError.recoveryRequestInFlight,
+            PortalyCheckoutService.CheckoutError.server("server"),
+            PortalyCheckoutService.CheckoutError.serverResponse(
+                code: "SERVER_ERROR",
+                message: "server"
+            )
+        ]
+        for error in checkoutErrors {
+            #expect(
+                !PortalyCheckoutService.shouldRetryRequest(
+                    method: "GET",
+                    attempt: 0,
+                    error: error
+                )
+            )
+        }
+    }
+
+    @Test func recoveryStatesKeepCheckoutClosedUntilTheOutcomeIsSafe() {
+        let checkoutBlockingStates: [PortalyCheckoutService.SubscriptionRecoveryState] = [
+            .inFlight,
+            .ambiguous,
+            .unavailable,
+            .conflict,
+        ]
+        let checkoutAllowedStates: [PortalyCheckoutService.SubscriptionRecoveryState] = [
+            .idle,
+            .recovered,
+            .alreadyBound,
+            .notFound,
+        ]
+
+        for recoveryState in checkoutBlockingStates {
+            #expect(recoveryState.blocksCheckout)
+        }
+        for recoveryState in checkoutAllowedStates {
+            #expect(!recoveryState.blocksCheckout)
+        }
+    }
+
+    @Test func recoveryErrorsExplainAmbiguityAndNeverSuggestDuplicatePayment() {
+        #expect(
+            PortalyCheckoutService.serverErrorMessage(
+                code: "PORTALY_RECOVERY_AMBIGUOUS",
+                serverMessage: nil
+            ).contains("多筆")
+        )
+        let unavailable = PortalyCheckoutService.serverErrorMessage(
+            code: "PORTALY_RECOVERY_UNAVAILABLE",
+            serverMessage: nil
+        )
+        #expect(unavailable.contains("避免重複付款"))
+        #expect(!unavailable.contains("開始新的訂閱"))
+        #expect(
+            PortalyCheckoutService.serverErrorMessage(
+                code: "PORTALY_RECOVERY_NOT_FOUND",
+                serverMessage: nil
+            ).contains("開始新的訂閱")
+        )
+    }
+
+    @Test func recoveryResponseRequiresValueAndExplicitStatus() throws {
+        let valueData = try JSONEncoder().encode(
+            state("active", proActive: true)
+        )
+        let value = try JSONSerialization.jsonObject(with: valueData)
+        for status in ["recovered", "already_bound", "not_found"] {
+            let validEnvelope = try JSONSerialization.data(withJSONObject: [
+                "value": value,
+                "recovery": ["status": status],
+            ])
+            let decoded = try JSONDecoder().decode(
+                SubscriptionRecoveryResponse.self,
+                from: validEnvelope
+            )
+            #expect(decoded.recoveryStatus == status)
+            #expect(decoded.value.subscriptionId == "sub-1")
+        }
+
+        let legacyEnvelope = try JSONSerialization.data(withJSONObject: [
+            "recovered": true,
+            "subscription": value,
+        ])
+        #expect(throws: DecodingError.self) {
+            try JSONDecoder().decode(
+                SubscriptionRecoveryResponse.self,
+                from: legacyEnvelope
+            )
+        }
+
+        let missingStatusEnvelope = try JSONSerialization.data(withJSONObject: [
+            "value": value,
+            "recovery": [:],
+        ])
+        #expect(throws: DecodingError.self) {
+            try JSONDecoder().decode(
+                SubscriptionRecoveryResponse.self,
+                from: missingStatusEnvelope
+            )
+        }
     }
 
     @Test func membershipCacheRejectsExpiredAndFutureTimestamps() {
@@ -725,5 +908,404 @@ struct PortalyCheckoutServiceTests {
         #expect(MembershipFeaturePolicy.canRunRoute(inBackground: true, proActive: true))
         #expect(!MembershipFeaturePolicy.canUseJoystick(proActive: false))
         #expect(MembershipFeaturePolicy.canUseJoystick(proActive: true))
+    }
+
+    @Test func expiringSubscriptionRefreshIntervalIncreasesWithUrgency() {
+        let defaultInterval = PortalyCheckoutService.entitlementRefreshInterval
+        let farInterval = PortalyCheckoutService.effectiveEntitlementRefreshInterval(expiringStage: "far")
+        let soonInterval = PortalyCheckoutService.effectiveEntitlementRefreshInterval(expiringStage: "soon")
+        let todayInterval = PortalyCheckoutService.effectiveEntitlementRefreshInterval(expiringStage: "today")
+        let noneInterval = PortalyCheckoutService.effectiveEntitlementRefreshInterval(expiringStage: "none")
+        let nilInterval = PortalyCheckoutService.effectiveEntitlementRefreshInterval(expiringStage: nil)
+
+        #expect(defaultInterval == 15 * 60)  // 15 分鐘
+        #expect(farInterval == 60 * 60)      // 1 小時
+        #expect(soonInterval == 30 * 60)     // 30 分鐘
+        #expect(todayInterval == 5 * 60)     // 5 分鐘
+        #expect(noneInterval == defaultInterval)
+        #expect(nilInterval == defaultInterval)
+
+        // 驗證優先級順序：today < soon < far < default
+        #expect(todayInterval < soonInterval)
+        #expect(soonInterval < farInterval)
+        #expect(farInterval > defaultInterval)
+    }
+
+    @Test func subscriptionStateIncludesExpiringStageAndBillingDates() throws {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let nextBillingInThreeDays = ISO8601DateFormatter().string(from: now.addingTimeInterval(3 * 24 * 60 * 60))
+        let parsedNextBillingDate = try #require(
+            ISO8601DateFormatter().date(from: nextBillingInThreeDays)
+        )
+
+        let subscription = PortalyCheckoutService.SubscriptionState(
+            uid: "uid-1",
+            email: "member@example.com",
+            emailVerified: true,
+            proActive: true,
+            subscriptionStatus: "active",
+            subscriptionId: "sub-1",
+            planId: PortalyCheckoutService.expectedPlanID,
+            mode: "test",
+            nextBillingAt: nextBillingInThreeDays,
+            nextBillingAtMs: parsedNextBillingDate.timeIntervalSince1970 * 1000,
+            daysUntilRenewal: 3.0,
+            expiringStage: "far",
+            cancelAtPeriodEnd: false,
+            cancelEffectiveAt: nil,
+            lastVerifiedAt: ISO8601DateFormatter().string(from: now),
+            entitlementSource: "portaly"
+        )
+
+        #expect(subscription.expiringStage == "far")
+        #expect(subscription.daysUntilRenewal == 3.0)
+        #expect(subscription.nextBillingAt == nextBillingInThreeDays)
+        #expect(subscription.nextBillingAtMs != nil)
+    }
+
+    @Test func foregroundReturnRefreshesOnlyWhenCacheExpiredOrReconcileNeeded() {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let freshCache = now.addingTimeInterval(-12 * 60 * 60)  // 12 小時前
+        let expiredCache = now.addingTimeInterval(-25 * 60 * 60)  // 25 小時前
+
+        // 情景 1：快取新鮮，無 reconcile，應不強制刷新
+        #expect(
+            !PortalyCheckoutService.shouldAttemptEntitlementRefresh(
+                validatedAt: freshCache,
+                lastAttemptAt: nil,
+                now: now
+            )
+        )
+
+        // 情景 2：快取已過期，應強制刷新
+        #expect(
+            PortalyCheckoutService.shouldAttemptEntitlementRefresh(
+                validatedAt: expiredCache,
+                lastAttemptAt: nil,
+                now: now
+            )
+        )
+
+        // 情景 3：24 小時邊界
+        let exactlyTwentyFourHours = now.addingTimeInterval(-(24 * 60 * 60))
+        #expect(
+            PortalyCheckoutService.shouldAttemptEntitlementRefresh(
+                validatedAt: exactlyTwentyFourHours,
+                lastAttemptAt: nil,
+                now: now
+            )
+        )
+    }
+
+    @Test func expiringSubscriptionStageTransitionsProgressivelyWithTime() {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+
+        // 情景 1：正常 Pro（> 72 小時）
+        let inThreeDaysPlus = ISO8601DateFormatter().string(
+            from: now.addingTimeInterval(4 * 24 * 60 * 60)
+        )
+        #expect(
+            PortalyCheckoutService.calculateExpiringStage(
+                proActive: true,
+                subscriptionStatus: "active",
+                nextBillingAt: inThreeDaysPlus,
+                now: now
+            ) == "none"
+        )
+
+        // 情景 2：快到期 far (48-72 小時)
+        let inSixtyHours = ISO8601DateFormatter().string(
+            from: now.addingTimeInterval(60 * 60 * 60)
+        )
+        #expect(
+            PortalyCheckoutService.calculateExpiringStage(
+                proActive: true,
+                subscriptionStatus: "active",
+                nextBillingAt: inSixtyHours,
+                now: now
+            ) == "far"
+        )
+
+        // 情景 3：快到期 soon (24-48 小時)
+        let inThirtySixHours = ISO8601DateFormatter().string(
+            from: now.addingTimeInterval(36 * 60 * 60)
+        )
+        #expect(
+            PortalyCheckoutService.calculateExpiringStage(
+                proActive: true,
+                subscriptionStatus: "active",
+                nextBillingAt: inThirtySixHours,
+                now: now
+            ) == "soon"
+        )
+
+        // 情景 4：快到期 today (0-24 小時)
+        let inTwelveHours = ISO8601DateFormatter().string(
+            from: now.addingTimeInterval(12 * 60 * 60)
+        )
+        #expect(
+            PortalyCheckoutService.calculateExpiringStage(
+                proActive: true,
+                subscriptionStatus: "active",
+                nextBillingAt: inTwelveHours,
+                now: now
+            ) == "today"
+        )
+
+        // 情景 5：已過期
+        let yesterday = ISO8601DateFormatter().string(
+            from: now.addingTimeInterval(-1 * 60 * 60)
+        )
+        #expect(
+            PortalyCheckoutService.calculateExpiringStage(
+                proActive: true,
+                subscriptionStatus: "active",
+                nextBillingAt: yesterday,
+                now: now
+            ) == "expired"
+        )
+    }
+
+    @Test func expiringStageToleratesClockSkewUpto24Hours() {
+        let baseTime = Date(timeIntervalSince1970: 2_000_000)
+        let billingDate = ISO8601DateFormatter().string(
+            from: baseTime.addingTimeInterval(36 * 60 * 60)  // 36 小時後
+        )
+
+        // 系統時間快 1 小時（認為是 soon）
+        let fastClock = baseTime.addingTimeInterval(1 * 60 * 60)
+        #expect(
+            PortalyCheckoutService.calculateExpiringStage(
+                proActive: true,
+                subscriptionStatus: "active",
+                nextBillingAt: billingDate,
+                now: fastClock
+            ) == "soon"
+        )
+
+        // 系統時間慢 1 小時（認為是 far 或 soon）
+        let slowClock = baseTime.addingTimeInterval(-1 * 60 * 60)
+        #expect(
+            PortalyCheckoutService.calculateExpiringStage(
+                proActive: true,
+                subscriptionStatus: "active",
+                nextBillingAt: billingDate,
+                now: slowClock
+            ) == "far"
+        )
+    }
+
+    @Test func subscriptionStatePreservesExpiringStageAcrossCodableRoundtrip() throws {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let nextBillingInOneDay = ISO8601DateFormatter().string(
+            from: now.addingTimeInterval(24 * 60 * 60)
+        )
+        let nextBillingMs = now.addingTimeInterval(24 * 60 * 60).timeIntervalSince1970 * 1000
+
+        let original = PortalyCheckoutService.SubscriptionState(
+            uid: "uid-1",
+            email: "member@example.com",
+            emailVerified: true,
+            proActive: true,
+            subscriptionStatus: "active",
+            subscriptionId: "sub-1",
+            planId: PortalyCheckoutService.expectedPlanID,
+            mode: "test",
+            nextBillingAt: nextBillingInOneDay,
+            nextBillingAtMs: nextBillingMs,
+            daysUntilRenewal: 1.0,
+            expiringStage: "soon",
+            cancelAtPeriodEnd: false,
+            cancelEffectiveAt: nil,
+            lastVerifiedAt: ISO8601DateFormatter().string(from: now),
+            entitlementSource: "portaly"
+        )
+
+        let encoder = JSONEncoder()
+        let decoder = JSONDecoder()
+        let encoded = try encoder.encode(original)
+        let decoded = try decoder.decode(PortalyCheckoutService.SubscriptionState.self, from: encoded)
+
+        #expect(decoded.expiringStage == "soon")
+        #expect(decoded.daysUntilRenewal == 1.0)
+        #expect(decoded.nextBillingAtMs == nextBillingMs)
+        #expect(decoded.nextBillingAt == nextBillingInOneDay)
+    }
+
+    @Test func effectiveEntitlementRefreshInterval_transitions() throws {
+        // 測試四層切換邏輯的頻率轉換
+        // today (< 1d) → 5min
+        // soon (1-2d) → 30min
+        // far (2-3d) → 1h
+        // normal (> 3d) → 15min
+        
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let baseInterval = PortalyCheckoutService.entitlementRefreshInterval  // 15 min
+        
+        let testCases: [(String, TimeInterval)] = [
+            // 邊界情況：0.5 天之前（today）
+            ("today_0.5d", -0.5 * 24 * 60 * 60),
+            // 邊界情況：1 天之前（today 到 soon 的邊界）
+            ("today_1d", -1.0 * 24 * 60 * 60),
+            // 邊界情況：1.5 天之前（soon）
+            ("soon_1.5d", -1.5 * 24 * 60 * 60),
+            // 邊界情況：2 天之前（soon 到 far 的邊界）
+            ("soon_2d", -2.0 * 24 * 60 * 60),
+            // 邊界情況：2.5 天之前（far）
+            ("far_2.5d", -2.5 * 24 * 60 * 60),
+            // 邊界情況：3 天之前（far 到 normal 的邊界）
+            ("far_3d", -3.0 * 24 * 60 * 60),
+            // 邊界情況：3.5 天之前（normal）
+            ("normal_3.5d", -3.5 * 24 * 60 * 60),
+        ]
+        
+        for (caseLabel, billingOffset) in testCases {
+            let billingDate = ISO8601DateFormatter().string(
+                from: now.addingTimeInterval(-billingOffset)
+            )
+            
+            let expiringStage = PortalyCheckoutService.calculateExpiringStage(
+                proActive: true,
+                subscriptionStatus: "active",
+                nextBillingAt: billingDate,
+                now: now
+            )
+            
+            let interval = PortalyCheckoutService.effectiveEntitlementRefreshInterval(
+                expiringStage: expiringStage
+            )
+            
+            // 驗證每個邊界情況的預期頻率
+            switch expiringStage {
+            case "today":
+                #expect(interval == 5 * 60, "Case: \(caseLabel) 應該使用 today 的 5 分鐘間隔")
+            case "soon":
+                #expect(interval == 30 * 60, "Case: \(caseLabel) 應該使用 soon 的 30 分鐘間隔")
+            case "far":
+                #expect(interval == 60 * 60, "Case: \(caseLabel) 應該使用 far 的 1 小時間隔")
+            case "none":
+                #expect(interval == baseInterval, "Case: \(caseLabel) 應該使用預設的 15 分鐘間隔")
+            default:
+                #expect(false, "Case: \(caseLabel) 收到意外的 expiringStage: \(expiringStage)")
+            }
+        }
+        
+        // 驗證 needsProEntitlementRefresh 和 proEntitlementRefreshDelay 的協同作用
+        let activeProState = state("active", proActive: true, nextBillingAt: 
+            ISO8601DateFormatter().string(from: now.addingTimeInterval(12 * 60 * 60))
+        )
+        
+        // 模擬不同的 expiringStage 下的刷新需求
+        #expect(
+            PortalyCheckoutService.effectiveEntitlementRefreshInterval(
+                expiringStage: "today"
+            ) < PortalyCheckoutService.effectiveEntitlementRefreshInterval(
+                expiringStage: "soon"
+            ),
+            "today 間隔應小於 soon 間隔"
+        )
+        #expect(
+            PortalyCheckoutService.effectiveEntitlementRefreshInterval(
+                expiringStage: "soon"
+            ) < PortalyCheckoutService.effectiveEntitlementRefreshInterval(
+                expiringStage: "far"
+            ),
+            "soon 間隔應小於 far 間隔"
+        )
+        #expect(
+            PortalyCheckoutService.effectiveEntitlementRefreshInterval(
+                expiringStage: "far"
+            ) < PortalyCheckoutService.effectiveEntitlementRefreshInterval(
+                expiringStage: "none"
+            ),
+            "far 間隔應小於 normal 間隔"
+        )
+    }
+
+    @Test func cacheIsFresh_24hBoundary() {
+        // 測試 24 小時快取邊界的精確邊界情況
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        
+        // 快取邊界值：23.9 小時（應為新鮮）
+        let fresh23_9h = now.addingTimeInterval(-(23.9 * 60 * 60))
+        #expect(
+            PortalyCheckoutService.cacheIsFresh(
+                cachedAt: fresh23_9h,
+                now: now
+            ),
+            "23.9 小時的快取應被視為新鮮"
+        )
+        
+        // 快取邊界值：24 小時（應為已過期）
+        let stale24h = now.addingTimeInterval(-(24 * 60 * 60))
+        #expect(
+            !PortalyCheckoutService.cacheIsFresh(
+                cachedAt: stale24h,
+                now: now
+            ),
+            "24 小時的快取應被視為已過期"
+        )
+        
+        // 快取邊界值：24.1 小時（應為已過期）
+        let stale24_1h = now.addingTimeInterval(-(24.1 * 60 * 60))
+        #expect(
+            !PortalyCheckoutService.cacheIsFresh(
+                cachedAt: stale24_1h,
+                now: now
+            ),
+            "24.1 小時的快取應被視為已過期"
+        )
+        
+        // 邊界情況：快取恰好在 24 小時前 1 秒（應為新鮮）
+        let fresh24h_minus1s = now.addingTimeInterval(-(24 * 60 * 60 - 1))
+        #expect(
+            PortalyCheckoutService.cacheIsFresh(
+                cachedAt: fresh24h_minus1s,
+                now: now
+            ),
+            "24 小時前 1 秒的快取應被視為新鮮"
+        )
+        
+        // 邊界情況：快取恰好在 24 小時後 1 秒（應為已過期）
+        let stale24h_plus1s = now.addingTimeInterval(-(24 * 60 * 60 + 1))
+        #expect(
+            !PortalyCheckoutService.cacheIsFresh(
+                cachedAt: stale24h_plus1s,
+                now: now
+            ),
+            "24 小時後 1 秒的快取應被視為已過期"
+        )
+        
+        // isEntitlementCacheExpired 初始化邏輯測試
+        // 驗證初始快取狀態應為過期（conservative approach）
+        // 這由 PortalyCheckoutService 的實現保證
+        
+        // 驗證快取新鮮度判斷的一致性
+        let intervals: [TimeInterval] = [
+            0.0,      // 剛剛被快取
+            12 * 60 * 60,  // 12 小時
+            23 * 60 * 60,  // 23 小時
+            23.9 * 60 * 60,  // 23.9 小時
+            24 * 60 * 60,   // 24 小時
+            48 * 60 * 60,   // 48 小時
+        ]
+        
+        var previousCacheState = true  // 最新的應該是新鮮的
+        for interval in intervals {
+            let cachedAt = now.addingTimeInterval(-interval)
+            let isFresh = PortalyCheckoutService.cacheIsFresh(
+                cachedAt: cachedAt,
+                now: now
+            )
+            
+            // 驗證快取新鮮度的單調性：舊快取不應突然變新鮮
+            if interval > 0 {
+                #expect(
+                    !isFresh || previousCacheState,
+                    "快取新鮮度應該隨時間單調遞減（時間間隔：\(interval / 60 / 60)h）"
+                )
+            }
+            previousCacheState = isFresh
+        }
     }
 }

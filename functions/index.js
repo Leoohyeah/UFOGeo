@@ -20,6 +20,18 @@ import {
   verifyCallbackEnvelope,
 } from "./portaly-callback.mjs";
 import {
+  listCustomerSubscriptions,
+  portalyRequest,
+  publicCheckoutError,
+  reportSkillVersion as clientReportSkillVersion,
+} from "./services/portaly-client.mjs";
+import {
+  collections,
+  collectionDocRef,
+  entitlementGrantRef as entitlementGrantDocRef,
+  userDocRef,
+} from "./services/firestore-collections.mjs";
+import {
   callbackMatchesCheckoutSession,
   callbackModeMatchesDeployment,
   CHECKOUT_UNCERTAIN_HOLD_MS,
@@ -40,6 +52,14 @@ import {
   verifiedCheckoutSessionState,
 } from "./checkout-session-reconciliation.mjs";
 import {
+  orphanCallbackRecoveryDecision,
+  orphanCheckoutSessionRecord,
+} from "./orphan-callback-recovery.mjs";
+import {
+  refundReconciliationDecision,
+  refundReconciliationLeaseMatches,
+} from "./refund-reconciliation-state.mjs";
+import {
   accountDeletionTombstoneWrite,
   accountDeletionGuardDecision,
   completedAccountDeletionMatches,
@@ -54,6 +74,7 @@ import {
 import {
   customerSubscriptionKey,
   findBlockingCustomerSubscriptionStrict,
+  normalizeCustomerEmail,
   portalySubscriptions,
 } from "./customer-subscription-guard.mjs";
 import {
@@ -75,6 +96,17 @@ import {
   subscriptionStateResponse as buildSubscriptionStateResponse,
 } from "./subscription-response.mjs";
 import {requireFirebaseUser as authenticateFirebaseUser} from "./firebase-auth.mjs";
+import {
+  RECOVERY_LEASE_MS,
+  RECOVERY_LOCK_STATUS,
+  executeRecoveryWithLease,
+  recoveredSubscriptionState,
+  recoveryBindingDecision,
+  recoveryLockDecision,
+  recoveryResponseData,
+  recoveryResponseEnvelope,
+  selectRecoverableSubscription,
+} from "./subscription-recovery.mjs";
 
 initializeApp();
 
@@ -87,11 +119,17 @@ const PROJECT_ID = "ufogeo-adac7";
 const PUBLIC_BASE_URL = `https://${PROJECT_ID}.web.app`;
 const SUPPORT_EMAIL = "leoohyeah.app@gmail.com";
 const PORTALY_PLAN_ID = "JO5cmDQdqTtb6AkkcnNW";
-const PORTALY_SKILL_VERSION = "0.11.2";
+const PORTALY_SKILL_VERSION = "0.11.3";
 const API_HOST = (process.env.PORTALY_API_HOST || "https://portaly.ai").replace(/\/$/, "");
 const MAX_BODY_BYTES = 128 * 1024;
 const CHECKOUT_LEASE_MS = 60 * 1000;
 const DELETED_ACCOUNT_CANCELLATION_LEASE_MS = 60 * 1000;
+const REFUND_RECONCILIATION_KIND = "refund_reconciliation";
+const REFUND_RECONCILIATION_LEASE_MS = 60 * 1000;
+const REFUND_CALLBACK_EVENTS = new Set([
+  "creator_subscription.payment.refunded",
+  "creator_subscription.payment.refund_failed",
+]);
 let didReportSkillVersion = false;
 
 setGlobalOptions({
@@ -118,7 +156,7 @@ function toEpochMs(value) {
 }
 
 export async function findReusableCheckoutSession(userId, now = Date.now(), mode) {
-  const snapshot = await db.collection("checkoutSessions")
+  const snapshot = await db.collection(collections.checkoutSessions)
     .where("uid", "==", userId)
     .limit(100)
     .get();
@@ -151,106 +189,35 @@ function requireJsonBody(request) {
   return request.body;
 }
 
+function requireEmptyJsonBody(request) {
+  const body = requireJsonBody(request);
+  if (Object.keys(body).length !== 0) {
+    throw Object.assign(new Error("Recovery request body must be empty"), {
+      statusCode: 400,
+      code: "RECOVERY_BODY_MUST_BE_EMPTY",
+    });
+  }
+  return body;
+}
+
 function requireFirebaseUser(request, options = {}) {
   return authenticateFirebaseUser(request, {auth, ...options});
-}
-
-async function portalyRequest(path, {apiKey, method = "GET", body} = {}) {
-  const response = await fetch(`${API_HOST}${path}`, {
-    method,
-    headers: {
-      authorization: `Bearer ${apiKey}`,
-      ...(body ? {"content-type": "application/json"} : {}),
-    },
-    body: body ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(15_000),
-  });
-  const payload = await response.json().catch(() => ({}));
-  return {response, payload};
-}
-
-async function listCustomerSubscriptions({apiKey, customerEmail}) {
-  const subscriptions = [];
-  const seenCursors = new Set();
-  let startAfter = null;
-
-  // An ordinary customer has only a handful of subscriptions. The cap keeps
-  // a corrupt or cyclic provider cursor from exhausting the function timeout;
-  // reaching it fails closed instead of allowing another checkout or deleting
-  // an account while renewals may still exist.
-  for (let page = 0; page < 10; page += 1) {
-    const query = new URLSearchParams({
-      customerEmail,
-      limit: "100",
-    });
-    if (startAfter) query.set("startAfter", startAfter);
-
-    const {response, payload} = await portalyRequest(
-      `/api/creator-subscription/subscriptions?${query.toString()}`,
-      {apiKey},
-    );
-    if (!response.ok) {
-      throw Object.assign(new Error("Portaly subscription list request failed"), {
-        code: "PORTALY_SUBSCRIPTION_LIST_FAILED",
-        portalyStatus: response.status,
-        portalyCode: payload?.code || null,
-      });
-    }
-    if (!payload || typeof payload !== "object" || Array.isArray(payload) ||
-        !Array.isArray(payload.data) ||
-        !payload.pagination || typeof payload.pagination !== "object" ||
-        typeof payload.pagination.hasMore !== "boolean") {
-      throw Object.assign(new Error("Portaly subscription list response is invalid"), {
-        code: "PORTALY_SUBSCRIPTION_LIST_INVALID",
-      });
-    }
-
-    subscriptions.push(...portalySubscriptions(payload));
-    if (!payload.pagination.hasMore) return subscriptions;
-
-    const nextCursor = nonBlankString(payload.pagination.nextCursor);
-    if (!nextCursor || seenCursors.has(nextCursor)) {
-      throw Object.assign(new Error("Portaly subscription list cursor is invalid"), {
-        code: "PORTALY_SUBSCRIPTION_LIST_INVALID",
-      });
-    }
-    seenCursors.add(nextCursor);
-    startAfter = nextCursor;
-  }
-
-  throw Object.assign(new Error("Portaly subscription list is too large"), {
-    code: "PORTALY_SUBSCRIPTION_LIST_TOO_LARGE",
-  });
 }
 
 function reportSkillVersion(apiKey) {
   if (didReportSkillVersion) return;
   didReportSkillVersion = true;
-  void portalyRequest("/api/creator-subscription/skill-version", {
-    apiKey,
-    method: "POST",
-    body: {skillName: "portaly-payment", version: PORTALY_SKILL_VERSION},
-  }).catch(() => {});
-}
-
-function publicCheckoutError(portalyStatus, payload) {
-  switch (payload?.code) {
-  case "PLAN_INACTIVE":
-    return {status: 422, code: payload.code, message: "此訂閱方案目前沒有開放。"};
-  case "PLAN_NOT_FOUND":
-    return {status: 503, code: payload.code, message: `訂閱方案設定有誤，請寄信至 ${SUPPORT_EMAIL}。`};
-  case "YEARLY_TEMPORARILY_UNSUPPORTED":
-    return {status: 422, code: payload.code, message: "年繳方案目前暫時無法使用。"};
-  case "INVALID_DISCOUNT_CODE":
-    return {status: 400, code: payload.code, message: "折扣碼目前無法套用。"};
-  default:
-    logger.error("Portaly request failed", {status: portalyStatus, code: payload?.code || null});
-    return {status: 502, code: "PORTALY_REQUEST_FAILED", message: "目前無法建立付款流程，請稍後再試。"};
-  }
+  void clientReportSkillVersion(apiKey).catch(() => {});
 }
 
 function compact(object) {
   return Object.fromEntries(Object.entries(object).filter(([, value]) => value !== undefined));
+}
+
+function refundReconciliationDocumentId(subscriptionId, orderId) {
+  return `refund_${createHash("sha256")
+    .update(JSON.stringify(["ufogeo-refund-reconciliation-v1", subscriptionId, orderId]))
+    .digest("hex")}`;
 }
 
 function checkoutResponse(session, {duplicate, fallbackMode}) {
@@ -353,6 +320,7 @@ async function holdUncertainCheckout({
 
     transaction.set(lockRef, compact({
       uid: user.uid,
+      customerEmail: user.email,
       planId: PORTALY_PLAN_ID,
       mode,
       status: "uncertain",
@@ -360,6 +328,7 @@ async function holdUncertainCheckout({
       safetyHoldUntilMs,
       sessionId,
       merchantOrderNumber,
+      checkoutLeaseId: leaseId,
       checkoutUrl: FieldValue.delete(),
       expiresAt: session.expiresAt,
       leaseId: FieldValue.delete(),
@@ -388,10 +357,6 @@ async function createCheckout(request, response) {
   const user = await requireFirebaseUser(request, {verifiedEmail: true});
   const apiKey = PORTALY_API_KEY.value();
   const mode = requirePortalyMode(apiKey);
-  // A server-owned grant is authoritative before any provider preflight or
-  // checkout request.  The check is repeated around the lease/network
-  // boundary below to close the small admin-grant race window.
-  enforceCheckoutGrantDecision(await checkoutGrantDecisionForUser(user.uid));
   const now = Date.now();
   const fallbackSession = await findReusableCheckoutSession(user.uid, now, mode);
   const userRef = db.collection("users").doc(user.uid);
@@ -416,6 +381,7 @@ async function createCheckout(request, response) {
     refs.findIndex((candidate) => candidate.path === ref.path) === index,
   );
   const leaseId = randomUUID();
+  const merchantOrderNumber = `ufogeo-${user.uid.slice(0, 10)}-${now}-${randomUUID().slice(0, 8)}`;
 
   const decision = await db.runTransaction(async (transaction) => {
     const transactionNow = Date.now();
@@ -445,10 +411,13 @@ async function createCheckout(request, response) {
     if (value.kind === "acquire") {
       transaction.set(lockRef, {
         uid: user.uid,
+        customerEmail: user.email,
         planId: PORTALY_PLAN_ID,
         mode,
         status: "creating",
         leaseId,
+        checkoutLeaseId: leaseId,
+        merchantOrderNumber,
         leaseExpiresAtMs: transactionNow + CHECKOUT_LEASE_MS,
         safetyHoldUntilMs: transactionNow + CHECKOUT_UNCERTAIN_HOLD_MS,
         createdAt: FieldValue.serverTimestamp(),
@@ -493,16 +462,6 @@ async function createCheckout(request, response) {
       statusCode: 409,
       code: "EMAIL_CHECKOUT_CONFLICT",
     });
-  }
-
-  // Re-check immediately before the first Portaly request.  Grant creation is
-  // an administrator operation and can race a member's checkout attempt;
-  // releasing our lease keeps a newly granted account from entering provider
-  // preflight or creating a provider order.
-  const beforeProviderGrant = await checkoutGrantDecisionForUser(user.uid);
-  if (beforeProviderGrant.kind !== "allow") {
-    await releaseCheckoutLease(lockRef, leaseId);
-    enforceCheckoutGrantDecision(beforeProviderGrant);
   }
 
   // Report only after the final server-grant guard; this is the first provider
@@ -558,7 +517,6 @@ async function createCheckout(request, response) {
     enforceCheckoutGrantDecision(beforeCheckoutGrant);
   }
 
-  const merchantOrderNumber = `ufogeo-${user.uid.slice(0, 10)}-${now}-${randomUUID().slice(0, 8)}`;
   const callbackUrl = `${PUBLIC_BASE_URL}/api/portaly/callback`;
   let portalyResult;
   try {
@@ -569,8 +527,8 @@ async function createCheckout(request, response) {
         method: "POST",
         body: {
           planId: PORTALY_PLAN_ID,
-          successRedirectUrl: `${PUBLIC_BASE_URL}/payment/success/`,
-          cancelRedirectUrl: `${PUBLIC_BASE_URL}/payment/cancel/`,
+          successRedirectUrl: "ufogeo://portaly-return?flow=checkout",
+          cancelRedirectUrl: "ufogeo://portaly-return?flow=checkout",
           callbackUrl,
           subscriptionCallbackUrl: callbackUrl,
           merchantOrderNumber,
@@ -1019,7 +977,7 @@ function nonBlankString(value) {
 }
 
 function entitlementGrantRef(uid) {
-  return db.collection("entitlementGrants").doc(uid);
+  return entitlementGrantDocRef(db, uid);
 }
 
 async function userEntitlementGrant(uid) {
@@ -1177,10 +1135,11 @@ async function reconcilePortalySubscriptionForUser({
   }
   const initialSubscriptionId = nonBlankString(initialUser.subscriptionId);
   const initialCheckoutSessionId = nonBlankString(initialUser.currentCheckoutSessionId);
-  const lookupId = subscriptionReconciliationLookupId({
+  const lookupId = trustedLookupId ? subscriptionReconciliationLookupId({
+    trustedLookupId,
+  }) : subscriptionReconciliationLookupId({
     initialSubscriptionId,
     initialCheckoutSessionId,
-    trustedLookupId,
   });
 
   // Free users (and users whose failed checkout has no subscription) have no
@@ -1490,6 +1449,526 @@ async function reconcileSubscription(request, response) {
   return json(response, 200, body);
 }
 
+function recoveryAuditId({uid, subscriptionId, mode}) {
+  return createHash("sha256")
+    .update(JSON.stringify(["ufogeo-email-recovery-v1", uid, subscriptionId, mode]))
+    .digest("hex");
+}
+
+function recoveryError(code, message, statusCode = 409) {
+  throw Object.assign(new Error(message), {statusCode, code});
+}
+
+const RECOVERY_AMBIGUITY_CODES = new Set([
+  "SUBSCRIPTION_RECOVERY_AMBIGUOUS",
+]);
+const RECOVERY_CONFLICT_CODES = new Set([
+  "ACCOUNT_DELETION_IN_PROGRESS",
+  "CHECKOUT_IN_PROGRESS",
+  "CHECKOUT_SAFETY_HOLD",
+  "EMAIL_RECOVERY_IN_PROGRESS",
+  "EMAIL_RECOVERY_RACE",
+  "PENDING_CHECKOUT_EXISTS",
+  "RECOVERY_EXISTING_BINDING_CONFLICT",
+  "RECOVERY_LOCAL_IDENTITY_CONFLICT",
+  "RECOVERY_LOCAL_STATE_CONFLICT",
+  "RECOVERY_LOCAL_STATE_INVALID",
+  "RECOVERY_LOCK_SCOPE_CONFLICT",
+  "RECOVERY_PROVIDER_STATE_RACE",
+  "RECOVERY_SESSION_EMAIL_CONFLICT",
+  "RECOVERY_SESSION_IDENTITY_CONFLICT",
+  "RECOVERY_SESSION_OWNERSHIP_CONFLICT",
+  "RECOVERY_PENDING_CHECKOUT",
+]);
+
+function publicRecoveryError(error) {
+  const internalCode = error?.code;
+  if (RECOVERY_AMBIGUITY_CODES.has(internalCode)) {
+    return Object.assign(
+      new Error("找到多筆可用的 Portaly 訂閱，為避免誤綁定，請聯絡支援處理。"),
+      {statusCode: 409, code: "SUBSCRIPTION_RECOVERY_AMBIGUOUS"},
+    );
+  }
+  if (RECOVERY_CONFLICT_CODES.has(internalCode)) {
+    return Object.assign(
+      new Error("目前帳號已有不同的訂閱或付款狀態，為避免覆寫資料，請稍後再試。"),
+      {statusCode: 409, code: "SUBSCRIPTION_RECOVERY_CONFLICT"},
+    );
+  }
+  return Object.assign(
+    new Error("目前無法安全確認既有 Portaly 訂閱，請稍後再試。"),
+    {statusCode: 502, code: "PORTALY_SUBSCRIPTION_RECOVERY_FAILED"},
+  );
+}
+
+function currentUserEmailMatches(userData, email) {
+  if (userData.email === undefined || userData.email === null) return true;
+  return normalizeCustomerEmail(userData.email) === normalizeCustomerEmail(email);
+}
+
+function currentUserUidMatches(userData, uid) {
+  if (userData.uid === undefined || userData.uid === null) return true;
+  return typeof userData.uid === "string" && userData.uid === uid;
+}
+
+function assertRecoverySessionIdentity(
+  session,
+  {uid, email, planId, mode, subscriptionId, observedAtMs} = {},
+) {
+  if (!session || typeof session !== "object" || Array.isArray(session)) {
+    recoveryError("RECOVERY_SESSION_STATE_INVALID", "Recovery checkout session is invalid", 502);
+  }
+  if (session.uid !== undefined && session.uid !== null &&
+      (typeof session.uid !== "string" || session.uid !== uid) &&
+      session.accountDeleted !== true) {
+    recoveryError("RECOVERY_SESSION_OWNERSHIP_CONFLICT", "Recovery checkout session belongs to another account");
+  }
+  if (session.uid !== undefined && session.uid !== null &&
+      typeof session.uid !== "string") {
+    recoveryError("RECOVERY_SESSION_STATE_INVALID", "Recovery checkout session uid is invalid", 502);
+  }
+  if (session.customerEmail !== undefined && session.customerEmail !== null &&
+      normalizeCustomerEmail(session.customerEmail) !== normalizeCustomerEmail(email)) {
+    recoveryError("RECOVERY_SESSION_EMAIL_CONFLICT", "Recovery checkout session email does not match");
+  }
+  for (const [field, expected] of [
+    ["sessionId", subscriptionId],
+    ["subscriptionId", subscriptionId],
+    ["planId", planId],
+    ["mode", mode],
+  ]) {
+    if (session[field] !== undefined && session[field] !== null &&
+        (typeof session[field] !== "string" || session[field].trim() !== expected)) {
+      recoveryError("RECOVERY_SESSION_IDENTITY_CONFLICT", "Recovery checkout session identity does not match");
+    }
+  }
+  for (const field of ["lastCallbackAtMs", "lastReconciledAtMs"]) {
+    const value = Number(session[field]);
+    if (Number.isFinite(value) && value > observedAtMs) {
+      recoveryError("RECOVERY_PROVIDER_STATE_RACE", "Provider state changed during recovery");
+    }
+  }
+}
+
+function recoveryProviderPatch(
+  state,
+  {planId = PORTALY_PLAN_ID, clearMissing = false} = {},
+) {
+  const patch = {
+    subscriptionId: state.subscriptionId,
+    currentCheckoutSessionId: state.currentCheckoutSessionId,
+    planId,
+    mode: state.mode,
+    proActive: state.proActive,
+    subscriptionStatus: state.subscriptionStatus,
+    cancelAtPeriodEnd: state.cancelAtPeriodEnd,
+  };
+  const optionalFields = [
+    "nextBillingAt",
+    "cancelEffectiveAt",
+    "cancelRequestedAt",
+    "canceledAt",
+    "lastChargedAt",
+    "lastFailureAt",
+    "failureCount",
+  ];
+  for (const field of optionalFields) {
+    if (state[field] !== undefined) patch[field] = state[field];
+    else if (clearMissing) patch[field] = FieldValue.delete();
+  }
+  return patch;
+}
+
+async function releaseSubscriptionRecovery(lockRef, recoveryId) {
+  await db.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(lockRef);
+    const value = snapshot.data() || null;
+    if (snapshot.exists && value?.status === RECOVERY_LOCK_STATUS &&
+        value.recoveryId === recoveryId) {
+      transaction.delete(lockRef);
+    }
+  });
+}
+
+async function reserveSubscriptionRecovery({user, mode, subscriptionId, recoveryId}) {
+  const customerLockId = customerSubscriptionKey({
+    email: user.email,
+    planId: PORTALY_PLAN_ID,
+    mode,
+  });
+  if (!customerLockId) {
+    recoveryError("CUSTOMER_SUBSCRIPTION_KEY_INVALID", "無法確認訂閱帳號，請重新登入後再試。");
+  }
+  const userRef = db.collection("users").doc(user.uid);
+  const lockRef = db.collection("checkoutLocks").doc(customerLockId);
+  const reservation = await db.runTransaction(async (transaction) => {
+    const [userSnapshot, lockSnapshot] = await Promise.all([
+      transaction.get(userRef),
+      transaction.get(lockRef),
+    ]);
+    const current = userSnapshot.data() || {};
+    if (!currentUserEmailMatches(current, user.email) || !currentUserUidMatches(current, user.uid)) {
+      recoveryError("RECOVERY_LOCAL_IDENTITY_CONFLICT", "目前帳號資料與已驗證 Email 不一致。");
+    }
+    if ((current.accountDeleted !== undefined && typeof current.accountDeleted !== "boolean") ||
+        (current.accountDeleting !== undefined && typeof current.accountDeleting !== "boolean") ||
+        current.accountDeleted === true || current.accountDeleting === true ||
+        (current.accountDeletionId !== undefined && current.accountDeletionId !== null &&
+          !nonBlankString(current.accountDeletionId))) {
+      recoveryError("ACCOUNT_DELETION_IN_PROGRESS", "帳號刪除作業正在處理中，暫時無法恢復會員。");
+    }
+    const binding = subscriptionId ? recoveryBindingDecision(current, {
+      candidateId: subscriptionId,
+      planId: PORTALY_PLAN_ID,
+      mode,
+    }) : {kind: "allow"};
+    if (binding.kind === "conflict") {
+      recoveryError(
+        binding.code,
+        binding.code === "RECOVERY_PENDING_CHECKOUT" ?
+          "目前仍有尚未完成的付款流程，請先完成或等待流程確認。" :
+          "目前帳號已有不同的訂閱綁定，為避免覆蓋會員資料，暫時無法恢復。",
+      );
+    }
+    const lockDecision = recoveryLockDecision(lockSnapshot.exists ? lockSnapshot.data() : null, {
+      planId: PORTALY_PLAN_ID,
+      mode,
+      now: Date.now(),
+    });
+    if (lockDecision.kind === "in_progress") {
+      recoveryError("EMAIL_RECOVERY_IN_PROGRESS", "會員恢復作業正在進行中，請稍候再試。");
+    }
+    if (lockDecision.kind === "conflict") {
+      const lockMessage = lockDecision.code === "CHECKOUT_SAFETY_HOLD" ?
+        "付款建立結果尚未確認，為避免重複扣款，暫時無法恢復會員。" :
+        lockDecision.code === "PENDING_CHECKOUT_EXISTS" ||
+        lockDecision.code === "CHECKOUT_IN_PROGRESS" ?
+          "目前仍有尚未完成的付款流程，請先完成或等待流程確認。" :
+          "付款或會員刪除狀態尚未確認，暫時無法恢復會員。";
+      recoveryError(lockDecision.code, lockMessage);
+    }
+
+    const now = Date.now();
+    const lockPatch = {
+      uid: user.uid,
+      planId: PORTALY_PLAN_ID,
+      mode,
+      status: RECOVERY_LOCK_STATUS,
+      recoveryId,
+      leaseId: recoveryId,
+      leaseExpiresAtMs: now + RECOVERY_LEASE_MS,
+      updatedAt: FieldValue.serverTimestamp(),
+    };
+    if (!lockSnapshot.exists) lockPatch.createdAt = FieldValue.serverTimestamp();
+    transaction.set(lockRef, lockPatch, {merge: true});
+    return {lockRef, current, bindingKind: binding.kind};
+  });
+  return {lockRef, current: reservation.current, bindingKind: reservation.bindingKind};
+}
+
+async function queryRecoverableSubscription({apiKey, user, mode}) {
+  reportSkillVersion(apiKey);
+  let customerSubscriptions;
+  try {
+    customerSubscriptions = await listCustomerSubscriptions({
+      apiKey,
+      customerEmail: user.email,
+    });
+  } catch (error) {
+    logger.error("Portaly email recovery subscription list failed", {
+      code: error?.code || null,
+      portalyStatus: error?.portalyStatus || null,
+      portalyCode: error?.portalyCode || null,
+    });
+    recoveryError(
+      "RECOVERY_LIST_FAILED",
+      "目前無法確認既有訂閱，請稍後重新同步。",
+      502,
+    );
+  }
+
+  let candidate;
+  try {
+    candidate = selectRecoverableSubscription(customerSubscriptions, {
+      email: user.email,
+      planId: PORTALY_PLAN_ID,
+      mode,
+    });
+  } catch (error) {
+    if (error?.code === "SUBSCRIPTION_RECOVERY_AMBIGUOUS") {
+      recoveryError(
+        error.code,
+        "找到多筆符合的有效訂閱，為避免誤綁定，請聯絡支援處理。",
+      );
+    }
+    logger.error("Portaly email recovery subscription list is invalid", {
+      code: error?.code || null,
+    });
+    recoveryError(
+      "RECOVERY_LIST_INVALID",
+      "目前無法安全確認既有訂閱，請稍後重新同步。",
+      502,
+    );
+  }
+  if (!candidate) return null;
+
+  const subscriptionId = candidate.id;
+  let portalyResult;
+  try {
+    portalyResult = await portalyRequest(
+      `/api/creator-subscription/subscriptions/${encodeURIComponent(subscriptionId)}`,
+      {apiKey},
+    );
+  } catch (error) {
+    logger.error("Portaly email recovery subscription lookup threw", {
+      message: error?.message || "Unknown error",
+      subscriptionId,
+    });
+    recoveryError(
+      "RECOVERY_PROVIDER_FAILED",
+      "目前無法確認既有訂閱，請稍後重新同步。",
+      502,
+    );
+  }
+  if (!portalyResult.response.ok) {
+    logger.error("Portaly email recovery subscription lookup failed", {
+      status: portalyResult.response.status,
+      code: portalyResult.payload?.code || null,
+      subscriptionId,
+    });
+    recoveryError(
+      "RECOVERY_PROVIDER_FAILED",
+      "目前無法確認既有訂閱，請稍後重新同步。",
+      502,
+    );
+  }
+
+  let recovered;
+  try {
+    recovered = recoveredSubscriptionState({
+      remote: portalyResult.payload,
+      subscriptionId,
+      email: user.email,
+      planId: PORTALY_PLAN_ID,
+      mode,
+    });
+  } catch (error) {
+    logger.error("Portaly email recovery subscription response is invalid", {
+      code: error?.code || null,
+      subscriptionId,
+    });
+    recoveryError(
+      "RECOVERY_DETAIL_INVALID",
+      "目前無法安全確認既有訂閱，請稍後重新同步。",
+      502,
+    );
+  }
+  if (!recovered.recoverable) {
+    recoveryError(
+      "RECOVERY_STATE_CHANGED",
+      "訂閱狀態剛剛變更，請重新同步後再試。",
+    );
+  }
+  return {
+    subscriptionId,
+    ...recovered,
+    observedAtMs: Date.now(),
+  };
+}
+
+async function finalizeSubscriptionRecovery({user, mode, recoveryId, lockRef, recovered}) {
+  const userRef = db.collection("users").doc(user.uid);
+  const sessionRef = db.collection("checkoutSessions").doc(recovered.subscriptionId);
+  const grantRef = entitlementGrantRef(user.uid);
+  const auditRef = db.collection("portalyAudit").doc(recoveryAuditId({
+    uid: user.uid,
+    subscriptionId: recovered.subscriptionId,
+    mode,
+  }));
+  const result = await db.runTransaction(async (transaction) => {
+    const [lockSnapshot, userSnapshot, sessionSnapshot, grantSnapshot] = await Promise.all([
+      transaction.get(lockRef),
+      transaction.get(userRef),
+      transaction.get(sessionRef),
+      transaction.get(grantRef),
+    ]);
+    const lock = lockSnapshot.data() || null;
+    const leaseExpiresAtMs = Number(lock?.leaseExpiresAtMs);
+    if (!lockSnapshot.exists || lock.status !== RECOVERY_LOCK_STATUS ||
+        lock.recoveryId !== recoveryId || !Number.isFinite(leaseExpiresAtMs) ||
+        leaseExpiresAtMs <= Date.now()) {
+      recoveryError("EMAIL_RECOVERY_RACE", "會員恢復狀態已變更，請重新同步後再試。");
+    }
+    const current = userSnapshot.data() || {};
+    if (!currentUserEmailMatches(current, user.email) || !currentUserUidMatches(current, user.uid)) {
+      recoveryError("RECOVERY_LOCAL_IDENTITY_CONFLICT", "目前帳號資料與已驗證 Email 不一致。");
+    }
+    const binding = recoveryBindingDecision(current, {
+      candidateId: recovered.subscriptionId,
+      planId: PORTALY_PLAN_ID,
+      mode,
+    });
+    if (binding.kind === "conflict") {
+      recoveryError(
+        binding.code,
+        binding.code === "RECOVERY_PENDING_CHECKOUT" ?
+          "目前仍有尚未完成的付款流程，請先完成或等待流程確認。" :
+          "目前帳號已有不同的訂閱綁定，為避免覆蓋會員資料，暫時無法恢復。",
+      );
+    }
+    for (const field of ["lastCallbackAtMs", "lastReconciledAtMs"]) {
+      const value = Number(current[field]);
+      if (Number.isFinite(value) && value > recovered.observedAtMs) {
+        recoveryError("RECOVERY_PROVIDER_STATE_RACE", "Provider state changed during recovery");
+      }
+    }
+    if (sessionSnapshot.exists) {
+      assertRecoverySessionIdentity(sessionSnapshot.data(), {
+        uid: user.uid,
+        email: user.email,
+        planId: PORTALY_PLAN_ID,
+        mode,
+        subscriptionId: recovered.subscriptionId,
+        observedAtMs: recovered.observedAtMs,
+      });
+    }
+
+    const timestamp = FieldValue.serverTimestamp();
+    const providerPatch = recoveryProviderPatch(recovered.state, {
+      planId: PORTALY_PLAN_ID,
+      clearMissing: userSnapshot.exists,
+    });
+    const userWritePatch = {
+      ...providerPatch,
+      email: user.email,
+      emailVerified: true,
+      lastReconciledAt: timestamp,
+      lastReconciledAtMs: recovered.observedAtMs,
+      updatedAt: timestamp,
+    };
+    transaction.set(userRef, userWritePatch, {merge: true});
+
+    const sessionWritePatch = {
+      ...providerPatch,
+      uid: user.uid,
+      customerEmail: user.email,
+      sessionId: recovered.subscriptionId,
+      subscriptionId: recovered.subscriptionId,
+      planId: PORTALY_PLAN_ID,
+      mode,
+      status: recovered.state.subscriptionStatus,
+      providerStatus: recovered.value.status,
+      reconciliationRequired: false,
+      lastReconciledAt: timestamp,
+      lastReconciledAtMs: recovered.observedAtMs,
+      updatedAt: timestamp,
+    };
+    if (sessionSnapshot.exists) {
+      const previousSession = sessionSnapshot.data() || {};
+      if (previousSession.accountDeleted === true) {
+        sessionWritePatch.accountDeleted = FieldValue.delete();
+        sessionWritePatch.accountDeletionId = FieldValue.delete();
+        sessionWritePatch.accountDeletedAt = FieldValue.delete();
+      }
+    } else {
+      sessionWritePatch.createdAt = timestamp;
+    }
+    transaction.set(sessionRef, sessionWritePatch, {merge: true});
+    transaction.delete(lockRef);
+    transaction.set(auditRef, {
+      type: "email_subscription_recovery",
+      event: "creator_subscription.email_recovery",
+      uid: user.uid,
+      sessionId: recovered.subscriptionId,
+      subscriptionId: recovered.subscriptionId,
+      planId: PORTALY_PLAN_ID,
+      mode,
+      status: recovered.state.subscriptionStatus,
+      providerStatus: recovered.value.status,
+      appliedToSession: true,
+      appliedToCurrentUser: true,
+      recoveredAt: timestamp,
+      receivedAt: timestamp,
+    }, {merge: true});
+
+    return {
+      // `userWritePatch` is a Firestore merge patch and can contain delete
+      // transforms for provider fields omitted by this detail response.  Use
+      // the plain logical state for the API value instead of echoing those
+      // write-only sentinels into subscriptionStateResponse.
+      data: recoveryResponseData(current, recovered.state, {
+        planId: PORTALY_PLAN_ID,
+      }),
+      grant: grantSnapshot.exists ? grantSnapshot.data() : null,
+      bindingKind: binding.kind,
+    };
+  });
+  return {
+    status: result.bindingKind === "already_bound" ? "already_bound" : "recovered",
+    value: subscriptionStateResponse({
+      uid: user.uid,
+      email: user.email,
+      emailVerified: user.emailVerified,
+      data: result.data,
+      grant: result.grant,
+      expectedMode: mode,
+      lastVerifiedAt: new Date(recovered.observedAtMs).toISOString(),
+    }),
+  };
+}
+
+async function recoverSubscriptionByEmail(request, response) {
+  requireEmptyJsonBody(request);
+  const user = await requireFirebaseUser(request, {verifiedEmail: true});
+  try {
+    const apiKey = PORTALY_API_KEY.value();
+    const mode = requirePortalyMode(apiKey);
+    const recoveryId = randomUUID();
+    const workflow = await executeRecoveryWithLease({
+      reserve: () => reserveSubscriptionRecovery({
+        user,
+        mode,
+        recoveryId,
+      }),
+      discover: () => queryRecoverableSubscription({apiKey, user, mode}),
+      finalize: ({reservation, recovered}) => finalizeSubscriptionRecovery({
+        user,
+        mode,
+        recoveryId,
+        lockRef: reservation.lockRef,
+        recovered,
+      }),
+      release: (reservation) => releaseSubscriptionRecovery(reservation.lockRef, recoveryId),
+    });
+    if (workflow.status === "not_found") {
+      const snapshot = await db.collection("users").doc(user.uid).get();
+      const grant = await userEntitlementGrant(user.uid);
+      return json(response, 200, recoveryResponseEnvelope(
+        subscriptionStateResponse({
+          uid: user.uid,
+          email: user.email,
+          emailVerified: user.emailVerified,
+          data: snapshot.data() || {},
+          grant,
+          expectedMode: mode,
+        }),
+        "not_found",
+      ));
+    }
+    return json(response, 200, recoveryResponseEnvelope(
+      workflow.value,
+      workflow.status,
+    ));
+  } catch (error) {
+    if (error?.recoveryReleaseError) {
+      logger.error("Portaly email recovery lock release failed", {
+        code: error.recoveryReleaseError?.code || null,
+      });
+    }
+    throw publicRecoveryError(error);
+  }
+}
+
 async function createPortal(request, response) {
   requireJsonBody(request);
   const user = await requireFirebaseUser(request, {verifiedEmail: true});
@@ -1594,7 +2073,7 @@ async function createPortal(request, response) {
       {
         apiKey,
         method: "POST",
-        body: {customerEmail: user.email, returnUrl: `${PUBLIC_BASE_URL}/payment/account/`},
+        body: {customerEmail: user.email, returnUrl: "ufogeo://portaly-return?flow=portal"},
       },
     ));
   } catch (error) {
@@ -2142,6 +2621,146 @@ async function compensateDeletedAccountSubscription(compensation) {
   }
 }
 
+async function reconcileRefundSubscriptionMarker(marker) {
+  const markerRef = db.collection("portalyCompensations").doc(marker.id);
+  const leaseId = randomUUID();
+  const claim = await db.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(markerRef);
+    if (!snapshot.exists || snapshot.data()?.kind !== REFUND_RECONCILIATION_KIND ||
+        snapshot.data()?.status === "completed") {
+      return {kind: "complete"};
+    }
+    const current = snapshot.data() || {};
+    const leaseExpiresAtMs = Number(current.leaseExpiresAtMs);
+    if (current.status === "processing" && Number.isFinite(leaseExpiresAtMs) &&
+        leaseExpiresAtMs > Date.now()) {
+      return {kind: "in_progress"};
+    }
+    transaction.set(markerRef, {
+      status: "processing",
+      leaseId,
+      leaseExpiresAtMs: Date.now() + REFUND_RECONCILIATION_LEASE_MS,
+      attempts: Number.isInteger(current.attempts) ? current.attempts + 1 : 1,
+      updatedAt: FieldValue.serverTimestamp(),
+    }, {merge: true});
+    return {kind: "claimed", marker: current};
+  });
+
+  if (claim.kind === "complete") return;
+  if (claim.kind === "in_progress") {
+    throw Object.assign(new Error("Refund subscription reconciliation is already processing"), {
+      statusCode: 503,
+      code: "REFUND_RECONCILIATION_IN_PROGRESS",
+    });
+  }
+
+  const current = claim.marker;
+  try {
+    const apiKey = PORTALY_API_KEY.value();
+    const mode = requirePortalyMode(apiKey);
+    const uid = nonBlankString(current.uid);
+    const email = normalizeCustomerEmail(current.customerEmail);
+    const sessionId = nonBlankString(current.sessionId);
+    const subscriptionId = nonBlankString(current.subscriptionId);
+    const planId = nonBlankString(current.planId);
+    const markerMode = nonBlankString(current.mode);
+    const sourceEvent = nonBlankString(current.sourceEvent);
+    const sourceTimestampMs = Number(current.sourceTimestampMs);
+    if (!uid || !email || !sessionId || !subscriptionId || sessionId !== subscriptionId ||
+        planId !== PORTALY_PLAN_ID || markerMode !== mode ||
+        !REFUND_CALLBACK_EVENTS.has(sourceEvent) || !Number.isFinite(sourceTimestampMs)) {
+      throw Object.assign(new Error("Refund reconciliation marker identity is invalid"), {
+        code: "REFUND_RECONCILIATION_MARKER_INVALID",
+      });
+    }
+
+    const userRef = db.collection("users").doc(uid);
+    const userSnapshot = await userRef.get();
+    if (!userSnapshot.exists) {
+      throw Object.assign(new Error("Refund reconciliation user is missing"), {
+        code: "REFUND_RECONCILIATION_USER_MISSING",
+      });
+    }
+    const currentUser = userSnapshot.data() || {};
+    if (normalizeCustomerEmail(currentUser.email) !== email) {
+      throw Object.assign(new Error("Refund reconciliation email does not match"), {
+        code: "REFUND_RECONCILIATION_EMAIL_MISMATCH",
+      });
+    }
+
+    reportSkillVersion(apiKey);
+    await reconcilePortalySubscriptionForUser({
+      user: {
+        uid,
+        email: currentUser.email,
+        emailVerified: currentUser.emailVerified === true,
+      },
+      initialUser: currentUser,
+      apiKey,
+      expectedMode: mode,
+      trustedLookupId: subscriptionId,
+    });
+
+    await db.runTransaction(async (transaction) => {
+      const [markerSnapshot, sessionSnapshot] = await Promise.all([
+        transaction.get(markerRef),
+        transaction.get(db.collection("checkoutSessions").doc(current.sessionId)),
+      ]);
+      const latestMarker = markerSnapshot.data() || {};
+      if (!markerSnapshot.exists || !refundReconciliationLeaseMatches({
+        marker: latestMarker,
+        leaseId,
+        sourceTimestampMs,
+      })) {
+        return;
+      }
+      if (!sessionSnapshot.exists) {
+        throw Object.assign(new Error("Refund reconciliation checkout session is missing"), {
+          code: "REFUND_RECONCILIATION_SESSION_MISSING",
+        });
+      }
+      transaction.set(markerRef, {
+        status: "completed",
+        leaseId: FieldValue.delete(),
+        leaseExpiresAtMs: FieldValue.delete(),
+        completedAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      }, {merge: true});
+      transaction.set(sessionSnapshot.ref, {
+        refundReconciliation: FieldValue.delete(),
+        refundReconciliationRequired: FieldValue.delete(),
+        updatedAt: FieldValue.serverTimestamp(),
+      }, {merge: true});
+    });
+  } catch (error) {
+    await db.runTransaction(async (transaction) => {
+      const snapshot = await transaction.get(markerRef);
+      if (!snapshot.exists || snapshot.data()?.leaseId !== leaseId) return;
+      transaction.set(markerRef, {
+        status: "retry_pending",
+        leaseId: FieldValue.delete(),
+        leaseExpiresAtMs: FieldValue.delete(),
+        lastErrorCode: error?.code || "REFUND_RECONCILIATION_FAILED",
+        lastPortalyStatus: error?.portalyStatus || null,
+        lastPortalyCode: error?.portalyCode || null,
+        updatedAt: FieldValue.serverTimestamp(),
+      }, {merge: true});
+    });
+    logger.error("Refund subscription reconciliation remains pending", {
+      subscriptionId: current.subscriptionId || null,
+      orderId: current.orderId || null,
+      mode: current.mode || null,
+      code: error?.code || null,
+      portalyStatus: error?.portalyStatus || null,
+      portalyCode: error?.portalyCode || null,
+    });
+    throw Object.assign(new Error("Refund subscription reconciliation remains pending"), {
+      statusCode: 503,
+      code: "REFUND_RECONCILIATION_PENDING",
+    });
+  }
+}
+
 async function processCallback(request, response) {
   const payload = requireJsonBody(request);
   const verified = verifyCallbackEnvelope({
@@ -2158,24 +2777,54 @@ async function processCallback(request, response) {
   const expectedMode = requirePortalyMode(PORTALY_API_KEY.value());
 
   const isCheckoutFailure = event === "creator_subscription.checkout.failed";
-  const isRefundEvent = event === "creator_subscription.payment.refunded" ||
-    event === "creator_subscription.payment.refund_failed";
+  const isRefundEvent = REFUND_CALLBACK_EVENTS.has(event);
   const sessionRef = db.collection("checkoutSessions").doc(callbackIdentifier);
   const identity = eventIdentity(payload);
   const eventRef = identity ? db.collection("portalyEvents").doc(
     createHash("sha256").update(identity).digest("hex"),
   ) : null;
+  const orphanCallbackMode = nonBlankString(payload.mode);
+  const orphanCustomerLockId = orphanCallbackMode ? customerSubscriptionKey({
+    email: payload.customerEmail,
+    planId: payload.planId,
+    mode: orphanCallbackMode,
+  }) : null;
+  const orphanCustomerLockRef = orphanCustomerLockId ?
+    db.collection("checkoutLocks").doc(orphanCustomerLockId) : null;
+  const refundReconciliationId = isRefundEvent ? refundReconciliationDocumentId(
+    callbackIdentifier,
+    payload.orderId,
+  ) : null;
+  const refundReconciliationRef = refundReconciliationId ?
+    db.collection("portalyCompensations").doc(refundReconciliationId) : null;
 
   const result = await db.runTransaction(async (transaction) => {
-    const [sessionSnapshot, eventSnapshot] = await Promise.all([
-      transaction.get(sessionRef),
-      eventRef ? transaction.get(eventRef) : Promise.resolve(null),
-    ]);
+    const sessionSnapshot = await transaction.get(sessionRef);
+    const eventSnapshot = eventRef ? await transaction.get(eventRef) : null;
+    const orphanLockSnapshot = !sessionSnapshot.exists && orphanCustomerLockRef ?
+      await transaction.get(orphanCustomerLockRef) : null;
+    const refundMarkerSnapshot = refundReconciliationRef ?
+      await transaction.get(refundReconciliationRef) : null;
+    let session = sessionSnapshot.data() || null;
+    let orphanRecovery = null;
+    let orphanSessionRecord = null;
     if (!sessionSnapshot.exists) {
-      throw new CallbackError(503, "Checkout session is not available yet");
+      orphanRecovery = orphanCallbackRecoveryDecision({
+        payload,
+        lock: orphanLockSnapshot?.data() || null,
+        expectedMode,
+      });
+      if (orphanRecovery.kind !== "matched") {
+        throw new CallbackError(503, "Checkout session is not available yet");
+      }
+      orphanSessionRecord = orphanCheckoutSessionRecord({
+        payload,
+        event,
+        recovery: orphanRecovery,
+        lockId: orphanCustomerLockRef.id,
+      });
+      session = orphanSessionRecord;
     }
-
-    const session = sessionSnapshot.data();
     if (!callbackMatchesCheckoutSession(session, payload, {
       expectedPlanId: PORTALY_PLAN_ID,
     })) {
@@ -2183,24 +2832,157 @@ async function processCallback(request, response) {
     }
     const lockPlanId = payload.planId || session.planId;
     const callbackMode = payload.mode || session.mode;
+    const callbackMatchesDeployment = callbackModeMatchesDeployment(
+      callbackMode,
+      expectedMode,
+    );
+    const state = isRefundEvent ? null : subscriptionStateForEvent(event, payload);
+    const stateTimestampMs = callbackStateTimestampMs(
+      event,
+      payload,
+      verified.timestampMs,
+    );
+    const checkoutLocks = db.collection("checkoutLocks");
+    const storedLockId = nonBlankString(session.checkoutLockId);
+    const customerLockRef = storedLockId && !storedLockId.includes("/") ? checkoutLocks
+      .doc(storedLockId) : null;
+    const modeLockRef = session.uid && lockPlanId && callbackMode ? checkoutLocks
+      .doc(checkoutLockDocumentId(session.uid, lockPlanId, callbackMode)) : null;
+    const legacyLockRef = session.uid && lockPlanId ? checkoutLocks
+      .doc(checkoutLockDocumentId(session.uid, lockPlanId)) : null;
+    const lockRefs = [customerLockRef, modeLockRef, legacyLockRef].filter((ref, index, refs) =>
+      ref && refs.findIndex((candidate) => candidate.path === ref.path) === index,
+    );
+    const userRef = session.accountDeleted === true || !session.uid ? null :
+      db.collection("users").doc(session.uid);
+    const grantRef = userRef ? entitlementGrantRef(session.uid) : null;
+    const [lockSnapshots, userSnapshot, grantSnapshot] = await Promise.all([
+      Promise.all(lockRefs.map((ref) => orphanCustomerLockRef &&
+        ref.path === orphanCustomerLockRef.path ? orphanLockSnapshot : transaction.get(ref))),
+      userRef ? transaction.get(userRef) : Promise.resolve(null),
+      grantRef ? transaction.get(grantRef) : Promise.resolve(null),
+    ]);
+    const currentUser = userSnapshot?.data() || {};
+    const accountDeletionId = nonBlankString(session.accountDeletionId) ||
+      nonBlankString(currentUser.accountDeletionId) || "legacy-deleted-account";
+    const needsDeletedAccountCancellation = !isRefundEvent && deletedAccountCallbackNeedsCancellation({
+      accountDeleted: callbackMatchesDeployment &&
+        (session.accountDeleted === true || currentUser.accountDeleting === true),
+      subscriptionStatus: state.subscriptionStatus,
+      cancelAtPeriodEnd: state.cancelAtPeriodEnd,
+    });
+    const compensationId = needsDeletedAccountCancellation ? createHash("sha256")
+      .update(`${callbackIdentifier}:${accountDeletionId}`)
+      .digest("hex") : null;
+    const compensationRef = compensationId ?
+      db.collection("portalyCompensations").doc(compensationId) : null;
+    const compensationSnapshot = compensationRef ?
+      await transaction.get(compensationRef) : null;
+    const matchingLockRefs = callbackMatchesDeployment ? lockRefs.filter((ref, index) =>
+      checkoutLockMatchesSession(
+        lockSnapshots[index]?.data() || null,
+        callbackIdentifier,
+      )) : [];
+    if (orphanRecovery && callbackMatchesDeployment && orphanCustomerLockRef &&
+        !matchingLockRefs.some((ref) => ref.path === orphanCustomerLockRef.path)) {
+      matchingLockRefs.push(orphanCustomerLockRef);
+    }
+    if (compensationRef && !compensationSnapshot?.exists) {
+      transaction.create(compensationRef, {
+        subscriptionId: callbackIdentifier,
+        planId: lockPlanId,
+        mode: callbackMode,
+        accountDeletionId,
+        sourceEvent: event,
+        sourceTimestampMs: stateTimestampMs,
+        status: "pending",
+        attempts: 0,
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+    }
+
     // Refund outcomes are payment-order facts, not subscription state.  They
     // must be acknowledged and audited independently because Portaly may
-    // deliver them before or after a separate canceled callback.
+    // deliver them before or after a separate canceled callback.  A durable
+    // marker in the same checkout session asks the existing provider-backed
+    // reconciliation trigger to verify the subscription without treating the
+    // refund itself as cancellation proof.
     if (isRefundEvent) {
-      if (!eventRef) {
+      if (!eventRef || !refundReconciliationRef) {
         throw new CallbackError(400, "Refund callback has no order identity");
       }
-      if (eventSnapshot?.exists) {
-        return {duplicate: true};
+      const existingMarker = refundMarkerSnapshot?.data() || null;
+      const isDuplicate = eventSnapshot?.exists === true;
+      const {
+        markerIsCompleted,
+        shouldScheduleReconciliation,
+        sessionMarkerStatus,
+      } = refundReconciliationDecision({
+        marker: existingMarker,
+        markerExists: refundMarkerSnapshot?.exists === true,
+        isDuplicate,
+      });
+      const incomingTimestampMs = verified.timestampMs;
+      const existingTimestampMs = Number(existingMarker?.sourceTimestampMs);
+      const markerTimestampMs = Number.isFinite(existingTimestampMs) ?
+        Math.max(existingTimestampMs, incomingTimestampMs) : incomingTimestampMs;
+      const refundSessionMarker = {
+        refundReconciliation: {
+          markerId: refundReconciliationId,
+          status: sessionMarkerStatus,
+          orderId: payload.orderId.trim(),
+          subscriptionId: callbackIdentifier,
+          planId: lockPlanId,
+          mode: callbackMode,
+          sourceEvent: event,
+          sourceTimestampMs: markerTimestampMs,
+        },
+        refundReconciliationRequired: true,
+        updatedAt: FieldValue.serverTimestamp(),
+      };
+      if (orphanSessionRecord) {
+        transaction.create(sessionRef, {
+          ...orphanSessionRecord,
+          ...(shouldScheduleReconciliation ? refundSessionMarker : {}),
+          createdAt: FieldValue.serverTimestamp(),
+          orphanRecoveredAt: FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+      }
+      if (shouldScheduleReconciliation) {
+        if (!orphanSessionRecord) {
+          transaction.set(sessionRef, refundSessionMarker, {merge: true});
+        }
+        transaction.set(refundReconciliationRef, {
+          kind: REFUND_RECONCILIATION_KIND,
+          uid: session.uid || null,
+          customerEmail: session.customerEmail || payload.customerEmail,
+          sessionId: callbackIdentifier,
+          subscriptionId: callbackIdentifier,
+          orderId: payload.orderId.trim(),
+          planId: lockPlanId,
+          mode: callbackMode,
+          sourceEvent: event,
+          sourceTimestampMs: markerTimestampMs,
+          status: "pending",
+          leaseId: FieldValue.delete(),
+          leaseExpiresAtMs: FieldValue.delete(),
+          ...(markerIsCompleted ? {completedAt: FieldValue.delete()} : {}),
+          updatedAt: FieldValue.serverTimestamp(),
+        }, {merge: true});
+      }
+      if (isDuplicate) {
+        for (const lockRef of matchingLockRefs) transaction.delete(lockRef);
+        return {duplicate: true, refundOnly: true};
       }
       const receivedAt = FieldValue.serverTimestamp();
-      const orderId = payload.orderId.trim();
       transaction.create(eventRef, {
         identity,
         event,
         sessionId: payload.sessionId || callbackIdentifier,
         subscriptionId: payload.subscriptionId || callbackIdentifier,
-        orderId,
+        orderId: payload.orderId.trim(),
         paymentId: payload.paymentId || null,
         paymentReference: payload.paymentReference || null,
         mode: payload.mode || session.mode || null,
@@ -2209,7 +2991,7 @@ async function processCallback(request, response) {
       transaction.create(db.collection("portalyAudit").doc(), compact({
         uid: session.uid,
         event,
-        orderId,
+        orderId: payload.orderId.trim(),
         sessionId: payload.sessionId || callbackIdentifier,
         subscriptionId: payload.subscriptionId || callbackIdentifier,
         planId: payload.planId || session.planId || null,
@@ -2234,69 +3016,14 @@ async function processCallback(request, response) {
         mode: callbackMode || null,
         receivedAt,
       }));
+      for (const lockRef of matchingLockRefs) transaction.delete(lockRef);
       return {duplicate: false, refundOnly: true};
     }
-    const callbackMatchesDeployment = callbackModeMatchesDeployment(
-      callbackMode,
-      expectedMode,
-    );
-    const state = subscriptionStateForEvent(event, payload);
-    const stateTimestampMs = callbackStateTimestampMs(
-      event,
-      payload,
-      verified.timestampMs,
-    );
-    const checkoutLocks = db.collection("checkoutLocks");
-    const storedLockId = nonBlankString(session.checkoutLockId);
-    const customerLockRef = storedLockId && !storedLockId.includes("/") ? checkoutLocks
-      .doc(storedLockId) : null;
-    const modeLockRef = session.uid && lockPlanId && callbackMode ? checkoutLocks
-      .doc(checkoutLockDocumentId(session.uid, lockPlanId, callbackMode)) : null;
-    const legacyLockRef = session.uid && lockPlanId ? checkoutLocks
-      .doc(checkoutLockDocumentId(session.uid, lockPlanId)) : null;
-    const lockRefs = [customerLockRef, modeLockRef, legacyLockRef].filter((ref, index, refs) =>
-      ref && refs.findIndex((candidate) => candidate.path === ref.path) === index,
-    );
-    const userRef = session.accountDeleted === true || !session.uid ? null :
-      db.collection("users").doc(session.uid);
-    const grantRef = userRef ? entitlementGrantRef(session.uid) : null;
-    const [lockSnapshots, userSnapshot, grantSnapshot] = await Promise.all([
-      Promise.all(lockRefs.map((ref) => transaction.get(ref))),
-      userRef ? transaction.get(userRef) : Promise.resolve(null),
-      grantRef ? transaction.get(grantRef) : Promise.resolve(null),
-    ]);
-    const currentUser = userSnapshot?.data() || {};
-    const accountDeletionId = nonBlankString(session.accountDeletionId) ||
-      nonBlankString(currentUser.accountDeletionId) || "legacy-deleted-account";
-    const needsDeletedAccountCancellation = deletedAccountCallbackNeedsCancellation({
-      accountDeleted: callbackMatchesDeployment &&
-        (session.accountDeleted === true || currentUser.accountDeleting === true),
-      subscriptionStatus: state.subscriptionStatus,
-      cancelAtPeriodEnd: state.cancelAtPeriodEnd,
-    });
-    const compensationId = needsDeletedAccountCancellation ? createHash("sha256")
-      .update(`${callbackIdentifier}:${accountDeletionId}`)
-      .digest("hex") : null;
-    const compensationRef = compensationId ?
-      db.collection("portalyCompensations").doc(compensationId) : null;
-    const compensationSnapshot = compensationRef ?
-      await transaction.get(compensationRef) : null;
-    const matchingLockRefs = callbackMatchesDeployment ? lockRefs.filter((ref, index) =>
-      checkoutLockMatchesSession(
-        lockSnapshots[index]?.data() || null,
-        callbackIdentifier,
-      )) : [];
-    if (compensationRef && !compensationSnapshot?.exists) {
-      transaction.create(compensationRef, {
-        subscriptionId: callbackIdentifier,
-        planId: lockPlanId,
-        mode: callbackMode,
-        accountDeletionId,
-        sourceEvent: event,
-        sourceTimestampMs: stateTimestampMs,
-        status: "pending",
-        attempts: 0,
+    if (orphanSessionRecord) {
+      transaction.create(sessionRef, {
+        ...orphanSessionRecord,
         createdAt: FieldValue.serverTimestamp(),
+        orphanRecoveredAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
       });
     }
@@ -2327,6 +3054,7 @@ async function processCallback(request, response) {
       }),
     );
     const now = FieldValue.serverTimestamp();
+    const receivedAtMs = Date.now();
 
     if (eventRef) {
       transaction.create(eventRef, {
@@ -2338,6 +3066,8 @@ async function processCallback(request, response) {
         paymentReference: payload.paymentReference || null,
         mode: payload.mode || session.mode || null,
         receivedAt: verified.timestamp,
+        receivedAtMs,
+        eventTimestampMs: verified.timestampMs,
       });
     }
     if (shouldApply) {
@@ -2355,6 +3085,7 @@ async function processCallback(request, response) {
         failedAt: payload.failedAt,
         mode: callbackMode,
         subscriptionId: isCheckoutFailure ? FieldValue.delete() : callbackIdentifier,
+        reconciliationRequired: orphanRecovery ? false : undefined,
         updatedAt: now,
       }), {merge: true});
     }
@@ -2431,6 +3162,19 @@ export const retryPortalyCompensation = onDocumentWritten(
     // platform retries re-deliver the original pending event after failures.
     if (value?.status !== "pending") return;
     const compensationId = nonBlankString(event.params?.compensationId);
+    if (value?.kind === REFUND_RECONCILIATION_KIND) {
+      if (!compensationId || !nonBlankString(value.uid) ||
+          !nonBlankString(value.sessionId) || !nonBlankString(value.subscriptionId) ||
+          !nonBlankString(value.planId) || !nonBlankString(value.mode) ||
+          !nonBlankString(value.orderId)) {
+        logger.error("Refund reconciliation marker is invalid", {compensationId});
+        return;
+      }
+      await reconcileRefundSubscriptionMarker({
+        id: compensationId,
+      });
+      return;
+    }
     const subscriptionId = nonBlankString(value.subscriptionId);
     const planId = nonBlankString(value.planId);
     const mode = nonBlankString(value.mode);
@@ -2463,6 +3207,9 @@ export const api = onRequest(
       }
       if (request.method === "POST" && pathMatches(request, "/api/portaly/subscription/reconcile")) {
         return await reconcileSubscription(request, response);
+      }
+      if (request.method === "POST" && pathMatches(request, "/api/portaly/subscription/recover")) {
+        return await recoverSubscriptionByEmail(request, response);
       }
       if (request.method === "POST" && pathMatches(request, "/api/portaly/portal")) {
         return await createPortal(request, response);

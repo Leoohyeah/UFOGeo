@@ -153,6 +153,9 @@ final class PortalyCheckoutService: ObservableObject {
         let planId: String
         let mode: String?
         let nextBillingAt: String?
+        let nextBillingAtMs: TimeInterval?
+        let daysUntilRenewal: Double?
+        let expiringStage: String?
         let cancelAtPeriodEnd: Bool
         let cancelEffectiveAt: String?
         let lastVerifiedAt: String?
@@ -169,6 +172,9 @@ final class PortalyCheckoutService: ObservableObject {
             planId: String,
             mode: String?,
             nextBillingAt: String?,
+            nextBillingAtMs: TimeInterval? = nil,
+            daysUntilRenewal: Double? = nil,
+            expiringStage: String? = nil,
             cancelAtPeriodEnd: Bool,
             cancelEffectiveAt: String?,
             lastVerifiedAt: String?,
@@ -184,6 +190,9 @@ final class PortalyCheckoutService: ObservableObject {
             self.planId = planId
             self.mode = mode
             self.nextBillingAt = nextBillingAt
+            self.nextBillingAtMs = nextBillingAtMs
+            self.daysUntilRenewal = daysUntilRenewal
+            self.expiringStage = expiringStage
             self.cancelAtPeriodEnd = cancelAtPeriodEnd
             self.cancelEffectiveAt = cancelEffectiveAt
             self.lastVerifiedAt = lastVerifiedAt
@@ -201,6 +210,9 @@ final class PortalyCheckoutService: ObservableObject {
             case planId
             case mode
             case nextBillingAt
+            case nextBillingAtMs
+            case daysUntilRenewal
+            case expiringStage
             case cancelAtPeriodEnd
             case cancelEffectiveAt
             case lastVerifiedAt
@@ -219,6 +231,9 @@ final class PortalyCheckoutService: ObservableObject {
             planId = try container.decode(String.self, forKey: .planId)
             mode = try container.decodeIfPresent(String.self, forKey: .mode)
             nextBillingAt = try container.decodeIfPresent(String.self, forKey: .nextBillingAt)
+            nextBillingAtMs = try container.decodeIfPresent(TimeInterval.self, forKey: .nextBillingAtMs)
+            daysUntilRenewal = try container.decodeIfPresent(Double.self, forKey: .daysUntilRenewal)
+            expiringStage = try container.decodeIfPresent(String.self, forKey: .expiringStage)
             cancelAtPeriodEnd = try container.decode(Bool.self, forKey: .cancelAtPeriodEnd)
             cancelEffectiveAt = try container.decodeIfPresent(String.self, forKey: .cancelEffectiveAt)
             lastVerifiedAt = try container.decodeIfPresent(String.self, forKey: .lastVerifiedAt)
@@ -557,7 +572,9 @@ final class PortalyCheckoutService: ObservableObject {
         case invalidResponse
         case checkoutRequestInFlight
         case portalRequestInFlight
+        case recoveryRequestInFlight
         case server(String)
+        case serverResponse(code: String?, message: String)
 
         var errorDescription: String? {
             switch self {
@@ -569,8 +586,43 @@ final class PortalyCheckoutService: ObservableObject {
                 return "付款頁面正在建立中，請稍候，不要重複點擊。"
             case .portalRequestInFlight:
                 return "訂閱管理頁面正在開啟，請稍候，不要重複點擊。"
+            case .recoveryRequestInFlight:
+                return "正在從 Portaly 恢復既有訂閱，請稍候。"
             case let .server(message):
                 return message
+            case let .serverResponse(_, message):
+                return message
+            }
+        }
+
+        var backendCode: String? {
+            guard case let .serverResponse(code, _) = self else { return nil }
+            return code
+        }
+    }
+
+    enum SubscriptionRecoveryOutcome: Equatable {
+        case recovered
+        case alreadyBound
+        case notFound
+    }
+
+    enum SubscriptionRecoveryState: Equatable {
+        case idle
+        case inFlight
+        case recovered
+        case alreadyBound
+        case notFound
+        case ambiguous
+        case unavailable
+        case conflict
+
+        var blocksCheckout: Bool {
+            switch self {
+            case .inFlight, .ambiguous, .unavailable, .conflict:
+                return true
+            case .idle, .recovered, .alreadyBound, .notFound:
+                return false
             }
         }
     }
@@ -585,6 +637,46 @@ final class PortalyCheckoutService: ObservableObject {
             return "此帳號已有免費 Pro 授權，無需訂閱或付款。"
         case "SERVER_GRANT_PORTAL_UNAVAILABLE":
             return "此帳號使用免費 Pro 授權，沒有需要管理的 Portaly 訂閱。"
+        case "PORTALY_RECOVERY_AMBIGUOUS", "SUBSCRIPTION_RECOVERY_AMBIGUOUS",
+             "RECOVERY_SUBSCRIPTION_AMBIGUOUS":
+            return "找到多筆可用的 Portaly 訂閱，為避免綁定錯誤，尚未變更帳號。請聯絡支援。"
+        case "PORTALY_REQUEST_UNCERTAIN", "PORTALY_RESPONSE_INCOMPLETE",
+             "PORTALY_CHECKOUT_RECONCILE_FAILED", "PORTALY_CHECKOUT_RECONCILE_UNCERTAIN":
+            if let serverMessage,
+               !serverMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return serverMessage
+            }
+            return "付款建立結果尚未確認，請先重新同步；確認前請勿重複付款。"
+        case "PORTALY_RECONCILE_REQUEST_UNCERTAIN", "PORTALY_RECONCILE_FAILED",
+             "PORTALY_RECONCILE_RESPONSE_INVALID":
+            if let serverMessage,
+               !serverMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return serverMessage
+            }
+            return "付款狀態尚未確認，請先重新同步；確認前請勿重複付款。"
+        case "CHECKOUT_SAFETY_HOLD":
+            if let serverMessage,
+               !serverMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return serverMessage
+            }
+            return "付款或帳號狀態尚未確認，為避免重複扣款，請先重新同步；確認前請勿重複付款。"
+        case "PENDING_CHECKOUT_EXISTS", "RECOVERY_PENDING_CHECKOUT":
+            if let serverMessage,
+               !serverMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return serverMessage
+            }
+            return "目前仍有尚未完成的付款流程，請先重新同步並等待流程確認；確認前請勿重複付款。"
+        case "PORTALY_RECOVERY_CONFLICT", "SUBSCRIPTION_RECOVERY_CONFLICT",
+             "RECOVERY_LOCAL_STATE_CONFLICT", "RECOVERY_EXISTING_BINDING_CONFLICT":
+            return "目前帳號已有不同的訂閱狀態，為避免覆寫資料，請重新同步或聯絡支援。"
+        case "PORTALY_RECOVERY_UNAVAILABLE", "SUBSCRIPTION_RECOVERY_UNAVAILABLE",
+             "PORTALY_RECOVERY_LIST_FAILED", "PORTALY_RECOVERY_PROVIDER_FAILED",
+             "PORTALY_RECOVERY_RESPONSE_INVALID", "PORTALY_RECOVERY_STATE_CHANGED":
+            return "目前無法確認 Portaly 訂閱。為避免重複付款，請稍後再試。"
+        case "PORTALY_RECOVERY_NOT_FOUND", "SUBSCRIPTION_RECOVERY_NOT_FOUND":
+            return "目前沒有找到可恢復的 Portaly Pro 訂閱；若要使用 Pro，可以開始新的訂閱。"
+        case "EMAIL_NOT_VERIFIED":
+            return "請先完成 Email 驗證，再恢復既有訂閱。"
         default:
             if let serverMessage,
                !serverMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -599,6 +691,7 @@ final class PortalyCheckoutService: ObservableObject {
     @Published private(set) var isPortalRequestInFlight = false
     @Published private(set) var subscription: SubscriptionState?
     @Published private(set) var isEntitlementCacheExpired = true
+    @Published private(set) var recoveryState: SubscriptionRecoveryState = .idle
 
     private static let checkoutCooldownSeconds: TimeInterval = 30
     private static let checkoutLockPrefix = "ufogeo.checkout-lock."
@@ -611,6 +704,80 @@ final class PortalyCheckoutService: ObservableObject {
         let timestamp = UserDefaults.standard.double(forKey: key)
         guard timestamp > 0 else { return false }
         return Date().timeIntervalSince1970 - timestamp < Self.checkoutCooldownSeconds
+    }
+
+    /// A recovery request is allowed only for the currently authenticated,
+    /// verified member and only when the local account has no usable Portaly
+    /// entitlement.  The server derives the email from the Firebase token;
+    /// the client never sends an email or subscription identifier for this
+    /// operation.
+    var shouldOfferSubscriptionRecovery: Bool {
+        guard let session = authService.session,
+              session.emailVerified,
+              recoveryState != .inFlight,
+              recoveryState != .recovered,
+              recoveryState != .alreadyBound else { return false }
+
+        guard let subscription,
+              subscription.uid == session.uid else { return true }
+        return !subscription.canonicalProjection(emailVerified: true).isPro
+    }
+
+    /// The initial account sync may try recovery once for a new Firebase UID.
+    /// A failed provider request is deliberately left to the user-initiated
+    /// retry button instead of being retried on every foreground refresh.
+    var shouldAttemptAutomaticSubscriptionRecovery: Bool {
+        guard shouldOfferSubscriptionRecovery,
+              let session = authService.session,
+              recoveryAttemptedIdentity != recoveryIdentity(for: session) else {
+            return false
+        }
+        guard let subscription,
+              subscription.uid == session.uid else { return false }
+        let payment = subscription.canonicalProjection(emailVerified: true).payment
+        return [.none, .checkoutFailed, .canceled].contains(payment)
+    }
+
+    var recoveryBlocksCheckout: Bool {
+        recoveryState.blocksCheckout
+    }
+
+    var isRecoveryRequestInFlight: Bool {
+        recoveryState == .inFlight
+    }
+
+    var recoveryStatusMessage: String? {
+        switch recoveryState {
+        case .idle, .alreadyBound:
+            return nil
+        case .inFlight:
+            return "正在從 Portaly 恢復既有訂閱；請稍候，不會建立新的付款或扣款。"
+        case .recovered:
+            return "已恢復既有 Portaly Pro 訂閱，不需要重新付款。"
+        case .notFound:
+            return "目前沒有找到可恢復的 Portaly Pro 訂閱；若要使用 Pro，可以開始新的訂閱。"
+        case .ambiguous:
+            return "找到多筆可用的 Portaly 訂閱，為避免綁定錯誤，尚未變更帳號。請聯絡支援。"
+        case .unavailable:
+            return "目前無法確認 Portaly 訂閱。為避免重複付款，請稍後再試。"
+        case .conflict:
+            return "目前帳號已有不同的訂閱狀態，為避免覆寫資料，請重新同步或聯絡支援。"
+        }
+    }
+
+    var recoveryStatusIcon: String {
+        switch recoveryState {
+        case .idle, .alreadyBound:
+            return "questionmark.circle"
+        case .inFlight:
+            return "arrow.triangle.2.circlepath"
+        case .recovered:
+            return "checkmark.seal.fill"
+        case .notFound:
+            return "info.circle"
+        case .ambiguous, .unavailable, .conflict:
+            return "exclamationmark.triangle.fill"
+        }
     }
 
     var isPro: Bool {
@@ -666,14 +833,16 @@ final class PortalyCheckoutService: ObservableObject {
     var needsProEntitlementRefresh: Bool {
         isPro && Self.shouldAttemptEntitlementRefresh(
             validatedAt: entitlementValidatedAt,
-            lastAttemptAt: lastEntitlementRefreshAttemptAt
+            lastAttemptAt: lastEntitlementRefreshAttemptAt,
+            interval: Self.effectiveEntitlementRefreshInterval(expiringStage: subscription?.expiringStage)
         )
     }
 
     var proEntitlementRefreshDelay: TimeInterval {
         Self.entitlementRefreshDelay(
             validatedAt: entitlementValidatedAt,
-            lastAttemptAt: lastEntitlementRefreshAttemptAt
+            lastAttemptAt: lastEntitlementRefreshAttemptAt,
+            interval: Self.effectiveEntitlementRefreshInterval(expiringStage: subscription?.expiringStage)
         )
     }
 
@@ -808,12 +977,16 @@ final class PortalyCheckoutService: ObservableObject {
 
     nonisolated private static let cacheLifetime: TimeInterval = 24 * 60 * 60
     nonisolated static let entitlementRefreshInterval: TimeInterval = 15 * 60
+    nonisolated private static let entitlementRefreshIntervalExpiringSoon: TimeInterval = 30 * 60  // 30 分鐘
+    nonisolated private static let entitlementRefreshIntervalExpiringToday: TimeInterval = 5 * 60  // 5 分鐘
+    nonisolated private static let entitlementRefreshIntervalExpiringFar: TimeInterval = 60 * 60  // 1 小時
     private static let keychainService = "tw.ufogeo.subscription"
     private static let keychainAccount = "verified-state"
     private let authService: FirebaseAuthService
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
-    private var needsSubscriptionReconcile = false
+    private let portakySession: URLSession
+    private(set) var needsSubscriptionReconcile = false
     private var reconcileMarkerUID: String?
     private var reconciliationInFlightID: UUID?
     private var foregroundSyncTask: Task<Void, Error>?
@@ -824,6 +997,9 @@ final class PortalyCheckoutService: ObservableObject {
     private var portalyReturnProcessorID: UUID?
     private var subscriptionRefreshTask: Task<SubscriptionState, Error>?
     private var subscriptionRefreshID: UUID?
+    private var recoveryTask: Task<SubscriptionRecoveryOutcome, Error>?
+    private var recoveryTaskID: UUID?
+    private var recoveryAttemptedIdentity: String?
     private var entitlementValidatedAt: Date?
     private var lastEntitlementRefreshAttemptAt: Date?
     private var entitlementExpiryTask: Task<Void, Never>?
@@ -832,6 +1008,15 @@ final class PortalyCheckoutService: ObservableObject {
     init(authService: FirebaseAuthService? = nil) {
         let resolvedAuthService = authService ?? FirebaseAuthService.shared
         self.authService = resolvedAuthService
+        
+        // 配置帶有適當超時的 URLSession
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 30  // 請求總超時 30 秒
+        config.timeoutIntervalForResource = 30  // 資源獲取超時 30 秒
+        config.waitsForConnectivity = true  // 等待連接可用
+        config.requestCachePolicy = .useProtocolCachePolicy
+        self.portakySession = URLSession(configuration: config)
+        
         if let uid = resolvedAuthService.session?.uid {
             reconcileMarkerUID = uid
             needsSubscriptionReconcile = Self.readReconcileMarker(for: uid)
@@ -843,6 +1028,9 @@ final class PortalyCheckoutService: ObservableObject {
             subscription = cache.value
             entitlementValidatedAt = cache.cachedAt
             isEntitlementCacheExpired = false
+        } else {
+            // 快取已過期或不存在，冷啟動時標記為過期
+            isEntitlementCacheExpired = true
         }
         scheduleEntitlementExpiry()
     }
@@ -850,6 +1038,23 @@ final class PortalyCheckoutService: ObservableObject {
     nonisolated static func cacheIsFresh(cachedAt: Date, now: Date = Date()) -> Bool {
         let age = now.timeIntervalSince(cachedAt)
         return age >= 0 && age < cacheLifetime
+    }
+
+    nonisolated static func effectiveEntitlementRefreshInterval(
+        expiringStage: String?,
+        defaultInterval: TimeInterval = entitlementRefreshInterval
+    ) -> TimeInterval {
+        guard let expiringStage else { return defaultInterval }
+        switch expiringStage {
+        case "today":
+            return entitlementRefreshIntervalExpiringToday
+        case "soon":
+            return entitlementRefreshIntervalExpiringSoon
+        case "far":
+            return entitlementRefreshIntervalExpiringFar
+        default:
+            return defaultInterval
+        }
     }
 
     nonisolated static func shouldAttemptEntitlementRefresh(
@@ -890,7 +1095,160 @@ final class PortalyCheckoutService: ObservableObject {
         return max(0, interval - attemptAge)
     }
 
+    nonisolated static func calculateExpiringStage(
+        proActive: Bool,
+        subscriptionStatus: String,
+        nextBillingAt: String?,
+        now: Date = Date()
+    ) -> String {
+        guard proActive, subscriptionStatus == "active", let billingDateString = nextBillingAt else {
+            return "none"
+        }
+
+        guard let billingDate = ISO8601DateFormatter().date(from: billingDateString) else {
+            return "none"
+        }
+
+        let daysUntilRenewal = billingDate.timeIntervalSince(now) / (24 * 60 * 60)
+
+        if daysUntilRenewal < 0 {
+            return "expired"
+        } else if daysUntilRenewal < 1 {
+            return "today"
+        } else if daysUntilRenewal < 2 {
+            return "soon"
+        } else if daysUntilRenewal < 3 {
+            return "far"
+        } else {
+            return "none"
+        }
+    }
+
+    /// Rebind a Portaly subscription to the currently authenticated Firebase
+    /// UID after the local Firebase/Firestore identity was rebuilt.  This is
+    /// intentionally a separate server endpoint: the client sends only an
+    /// empty JSON object and a Firebase bearer token, while the backend derives
+    /// the verified email, Portaly mode, plan, and candidate subscription.
+    @discardableResult
+    func recoverSubscription(
+        force: Bool = false
+    ) async throws -> SubscriptionRecoveryOutcome {
+        guard let expectedSession = authService.session else {
+            throw CheckoutError.server("請先登入 UFOGeo 帳號後再試。")
+        }
+        guard expectedSession.emailVerified else {
+            throw CheckoutError.serverResponse(
+                code: "EMAIL_NOT_VERIFIED",
+                message: Self.serverErrorMessage(
+                    code: "EMAIL_NOT_VERIFIED",
+                    serverMessage: nil
+                )
+            )
+        }
+
+        if !force,
+           let attemptedIdentity = recoveryAttemptedIdentity,
+           attemptedIdentity == recoveryIdentity(for: expectedSession) {
+            switch recoveryState {
+            case .recovered:
+                return .recovered
+            case .alreadyBound:
+                return .alreadyBound
+            case .notFound:
+                return .notFound
+            default:
+                break
+            }
+        }
+
+        // A valid local provider entitlement is already bound.  Do not make a
+        // second provider lookup just because a view appeared again.
+        if let current = subscription,
+           current.uid == expectedSession.uid,
+           current.canonicalProjection(emailVerified: true).isPro {
+            recoveryState = .alreadyBound
+            return .alreadyBound
+        }
+
+        if let recoveryTask {
+            return try await recoveryTask.value
+        }
+
+        let expectedUID = expectedSession.uid
+        let expectedEmail = expectedSession.email
+        recoveryAttemptedIdentity = recoveryIdentity(for: expectedSession)
+        recoveryState = .inFlight
+
+        let operationID = UUID()
+        let task = Task { @MainActor in
+            do {
+                // Email verification can complete while the app is open. Use
+                // a newly minted token so the backend sees the current claim.
+                _ = try await authService.validIDToken(forceRefresh: true)
+                let response: SubscriptionRecoveryResponse = try await authenticatedRequest(
+                    path: "/api/portaly/subscription/recover",
+                    method: "POST"
+                )
+                guard recoveryTaskID == operationID,
+                      authService.session?.uid == expectedUID else {
+                    throw CancellationError()
+                }
+                guard response.value.uid == expectedUID,
+                      Self.normalizedEmail(response.value.email) ==
+                        Self.normalizedEmail(expectedEmail),
+                      response.value.emailVerified,
+                      ["live", "test"].contains(response.value.mode ?? ""),
+                      response.value.canonicalProjection(emailVerified: true).entitlement !=
+                        .unavailable else {
+                    throw CheckoutError.invalidResponse
+                }
+
+                let outcome = try recoveryOutcome(
+                    status: response.recoveryStatus,
+                    state: response.value
+                )
+                try persistSubscription(response.value)
+                recoveryState = Self.recoveryState(for: outcome)
+                return outcome
+            } catch is CancellationError {
+                // A sign-out/session switch may cancel this operation after
+                // the request started. Never leave the next UID stuck behind
+                // the previous member's in-flight recovery state.
+                if recoveryTaskID == operationID {
+                    recoveryState = .idle
+                    recoveryAttemptedIdentity = nil
+                }
+                throw CancellationError()
+            } catch {
+                let failedState = Self.recoveryState(for: error)
+                recoveryState = failedState
+                if failedState == .notFound {
+                    // A compatible backend may use a 404 for the explicit
+                    // no-match result. It is safe to expose Free state only
+                    // when the server supplied this stable outcome code.
+                    return .notFound
+                }
+                throw error
+            }
+        }
+        recoveryTaskID = operationID
+        recoveryTask = task
+        defer {
+            if recoveryTaskID == operationID {
+                recoveryTask = nil
+                recoveryTaskID = nil
+            }
+        }
+        return try await task.value
+    }
+
     func createCheckoutURL() async throws -> URL {
+        guard !recoveryState.blocksCheckout else {
+            throw CheckoutError.serverResponse(
+                code: "PORTALY_RECOVERY_REQUIRED",
+                message: "目前正在確認既有 Portaly 訂閱，為避免重複付款，請先完成恢復或重新嘗試。"
+            )
+        }
         guard !isCheckoutRequestInFlight else {
             throw CheckoutError.checkoutRequestInFlight
         }
@@ -962,6 +1320,7 @@ final class PortalyCheckoutService: ObservableObject {
             entitlementValidatedAt = cache.cachedAt
             isEntitlementCacheExpired = false
             scheduleEntitlementExpiry()
+            markRecoveryStateForRefreshedSubscription(cache.value)
             return cache.value
         }
 
@@ -994,6 +1353,7 @@ final class PortalyCheckoutService: ObservableObject {
                 throw CheckoutError.invalidResponse
             }
             try persistSubscription(value)
+            markRecoveryStateForRefreshedSubscription(value)
             return value
         }
         subscriptionRefreshID = refreshID
@@ -1217,6 +1577,11 @@ final class PortalyCheckoutService: ObservableObject {
         subscriptionRefreshTask?.cancel()
         subscriptionRefreshTask = nil
         subscriptionRefreshID = nil
+        recoveryTask?.cancel()
+        recoveryTask = nil
+        recoveryTaskID = nil
+        recoveryAttemptedIdentity = nil
+        recoveryState = .idle
         entitlementExpiryTask?.cancel()
         entitlementExpiryTask = nil
         entitlementValidatedAt = nil
@@ -1229,6 +1594,86 @@ final class PortalyCheckoutService: ObservableObject {
             UserDefaults.standard.removeObject(forKey: Self.reconcileMarkerKey(for: markerUID))
         }
         KeychainStore.remove(service: Self.keychainService, account: Self.keychainAccount)
+    }
+
+    private static func recoveryState(
+        for outcome: SubscriptionRecoveryOutcome
+    ) -> SubscriptionRecoveryState {
+        switch outcome {
+        case .recovered:
+            return .recovered
+        case .alreadyBound:
+            return .alreadyBound
+        case .notFound:
+            return .notFound
+        }
+    }
+
+    private static func recoveryState(
+        for error: Error
+    ) -> SubscriptionRecoveryState {
+        guard let checkoutError = error as? CheckoutError else { return .unavailable }
+        switch checkoutError.backendCode {
+        case "PORTALY_RECOVERY_AMBIGUOUS", "SUBSCRIPTION_RECOVERY_AMBIGUOUS",
+             "RECOVERY_SUBSCRIPTION_AMBIGUOUS":
+            return .ambiguous
+        case "PORTALY_RECOVERY_CONFLICT", "SUBSCRIPTION_RECOVERY_CONFLICT",
+             "RECOVERY_LOCAL_STATE_CONFLICT", "RECOVERY_EXISTING_BINDING_CONFLICT",
+             "RECOVERY_PENDING_CHECKOUT", "PENDING_CHECKOUT_EXISTS", "CHECKOUT_SAFETY_HOLD":
+            return .conflict
+        case "PORTALY_RECOVERY_NOT_FOUND", "SUBSCRIPTION_RECOVERY_NOT_FOUND":
+            return .notFound
+        default:
+            return .unavailable
+        }
+    }
+
+    private func markRecoveryStateForRefreshedSubscription(
+        _ value: SubscriptionState
+    ) {
+        guard value.uid == authService.session?.uid else { return }
+        if value.proActive && value.subscriptionId != nil {
+            recoveryState = .alreadyBound
+        } else if recoveryState == .recovered || recoveryState == .alreadyBound {
+            recoveryState = .idle
+        }
+    }
+
+    private func recoveryOutcome(
+        status: String,
+        state: SubscriptionState
+    ) throws -> SubscriptionRecoveryOutcome {
+        let projection = state.canonicalProjection(emailVerified: true)
+        guard projection.entitlement != .unavailable else {
+            throw CheckoutError.invalidResponse
+        }
+        let hasPaidPortalyBinding = state.proActive
+            && state.subscriptionId != nil
+            && [.active, .pastDue, .canceling].contains(projection.payment)
+
+        switch status.trimmingCharacters(in: .whitespacesAndNewlines) {
+        case "recovered":
+            guard hasPaidPortalyBinding else { throw CheckoutError.invalidResponse }
+            return .recovered
+        case "already_bound", "alreadyBound":
+            guard hasPaidPortalyBinding else { throw CheckoutError.invalidResponse }
+            return .alreadyBound
+        case "not_found", "notFound":
+            guard !hasPaidPortalyBinding else { throw CheckoutError.invalidResponse }
+            return .notFound
+        default:
+            throw CheckoutError.invalidResponse
+        }
+    }
+
+    private func recoveryIdentity(
+        for session: FirebaseAuthService.Session
+    ) -> String {
+        "\(session.uid)|\(Self.normalizedEmail(session.email))"
+    }
+
+    private static func normalizedEmail(_ email: String) -> String {
+        email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
     private static func reconcileMarkerKey(for uid: String) -> String {
@@ -1295,24 +1740,100 @@ final class PortalyCheckoutService: ObservableObject {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = Data("{}".utf8)
         }
-        request.timeoutInterval = 20
+        let maximumAttempts = method == "GET" ? 2 : 1
+        for attempt in 0..<maximumAttempts {
+            do {
+                try Task.checkCancellation()
+                let (data, response) = try await portakySession.data(for: request)
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    throw CheckoutError.invalidResponse
+                }
+                guard (200...299).contains(httpResponse.statusCode) else {
+                    let errorResponse = try? decoder.decode(ErrorResponse.self, from: data)
+                    let message = Self.serverErrorMessage(
+                        code: errorResponse?.code,
+                        serverMessage: errorResponse?.error
+                    )
+                    throw CheckoutError.serverResponse(
+                        code: errorResponse?.code,
+                        message: message
+                    )
+                }
+                do {
+                    return try decoder.decode(Response.self, from: data)
+                } catch let decodingError as DecodingError {
+                    // 改進 Codable 解析的錯誤訊息
+                    let errorMessage = self.localizedDecodingErrorMessage(decodingError)
+                    #if DEBUG
+                    print("[PortalyCheckoutService] JSON 解析失敗: \(errorMessage)")
+                    #endif
+                    throw CheckoutError.invalidResponse
+                } catch {
+                    throw CheckoutError.invalidResponse
+                }
+            } catch let error as CheckoutError {
+                throw error
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let error as URLError {
+                guard Self.shouldRetryRequest(
+                    method: method,
+                    attempt: attempt,
+                    error: error
+                ) else {
+                    throw error
+                }
+                #if DEBUG
+                print("[PortalyCheckoutService] GET 暫時性網路錯誤，500ms 後重試：\(error.localizedDescription)")
+                #endif
+                try await Task.sleep(nanoseconds: 500_000_000)
+            } catch {
+                throw error
+            }
+        }
+        throw CheckoutError.invalidResponse
+    }
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw CheckoutError.invalidResponse
+    nonisolated static func shouldRetryRequest(
+        method: String,
+        attempt: Int,
+        error: Error
+    ) -> Bool {
+        guard method == "GET",
+              attempt == 0,
+              let urlError = error as? URLError else {
+            return false
         }
-        guard (200...299).contains(httpResponse.statusCode) else {
-            let errorResponse = try? decoder.decode(ErrorResponse.self, from: data)
-            let message = Self.serverErrorMessage(
-                code: errorResponse?.code,
-                serverMessage: errorResponse?.error
-            )
-            throw CheckoutError.server(message)
+        return isRetryableNetworkError(urlError)
+    }
+
+    private nonisolated static func isRetryableNetworkError(_ error: URLError) -> Bool {
+        switch error.code {
+        case .timedOut,
+             .networkConnectionLost,
+             .notConnectedToInternet,
+             .cannotFindHost,
+             .cannotConnectToHost,
+             .dnsLookupFailed:
+            return true
+        default:
+            return false
         }
-        do {
-            return try decoder.decode(Response.self, from: data)
-        } catch {
-            throw CheckoutError.invalidResponse
+    }
+
+    /// 本地化 Decodable 解析錯誤訊息
+    private func localizedDecodingErrorMessage(_ error: DecodingError) -> String {
+        switch error {
+        case .dataCorrupted(let context):
+            return "訂閱數據格式不正確: \(context.debugDescription)"
+        case .keyNotFound(let key, let context):
+            return "缺少必要的訂閱信息 (\(key.stringValue)): \(context.debugDescription)"
+        case .typeMismatch(let type, let context):
+            return "訂閱數據類型不符 (期望 \(type)): \(context.debugDescription)"
+        case .valueNotFound(let type, let context):
+            return "訂閱數據為空 (期望 \(type)): \(context.debugDescription)"
+        @unknown default:
+            return "訂閱數據解析失敗"
         }
     }
 
@@ -1415,16 +1936,70 @@ final class PortalyCheckoutService: ObservableObject {
     }
 }
 
-private struct SubscriptionResponse: Decodable {
+/// The recovery endpoint has a dedicated, strict envelope.  In particular,
+/// do not decode the legacy `{recovered, subscription}` response here: the
+/// explicit `recovery.status` is the server's authoritative outcome.
+struct SubscriptionRecoveryResponse: Decodable {
     let value: PortalyCheckoutService.SubscriptionState
+    let recoveryStatus: String
 
     private enum CodingKeys: String, CodingKey {
-        case subscription
-        case data
+        case value
+        case recovery
+    }
+
+    private struct Recovery: Decodable {
+        let status: String
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        value = try container.decode(
+            PortalyCheckoutService.SubscriptionState.self,
+            forKey: .value
+        )
+        let recovery = try container.decode(Recovery.self, forKey: .recovery)
+        guard !recovery.status.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .recovery,
+                in: container,
+                debugDescription: "Recovery status must not be empty"
+            )
+        }
+
+        recoveryStatus = recovery.status
+    }
+}
+
+private struct SubscriptionResponse: Decodable {
+    let value: PortalyCheckoutService.SubscriptionState
+    let recoveryStatus: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case value
+        case subscription
+        case data
+        case recovery
+    }
+
+    private struct Recovery: Decodable {
+        let status: String?
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if let recovery = try? container.decode(Recovery.self, forKey: .recovery) {
+            recoveryStatus = recovery.status
+        } else {
+            recoveryStatus = nil
+        }
+        if let nested = try? container.decode(
+            PortalyCheckoutService.SubscriptionState.self,
+            forKey: .value
+        ) {
+            value = nested
+            return
+        }
         if let nested = try? container.decode(
             PortalyCheckoutService.SubscriptionState.self,
             forKey: .subscription

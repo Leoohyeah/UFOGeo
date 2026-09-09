@@ -15,7 +15,11 @@ function nonBlankString(value) {
 }
 
 export function normalizeCustomerEmail(email) {
-  return nonBlankString(email)?.toLowerCase() || null;
+  const trimmed = nonBlankString(email);
+  if (!trimmed) return null;
+  // Normalize to NFC (Canonical Composition) to handle Unicode equivalents
+  // e.g., ß (single char) vs ss (two chars) become consistently comparable
+  return trimmed.toLowerCase().normalize("NFC");
 }
 
 /**

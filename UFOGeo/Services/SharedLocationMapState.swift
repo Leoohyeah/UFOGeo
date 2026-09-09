@@ -157,6 +157,7 @@ final class SharedLocationMapState: ObservableObject {
     private var isTunnelTestInFlight = false
     private var pendingForcedTunnelRetest = false
     private var lastTunnelTestAt: Date = .distantPast
+    private var lastTunnelSuccessAt: Date = .distantPast
 
     var isSimulationInteractionLocked: Bool {
         isSimulationActive || isSimulationTransitioning
@@ -194,6 +195,23 @@ final class SharedLocationMapState: ObservableObject {
            now.timeIntervalSince(lastTunnelTestAt) < Self.tunnelTestMinInterval {
             return
         }
+
+        if let existing = tunnelConnection {
+            switch existing.state {
+            case .ready:
+                isTunnelReachable = true
+                lastTunnelSuccessAt = now
+                return
+            case .failed, .cancelled:
+                tunnelConnection = nil
+            default:
+                if force {
+                    pendingForcedTunnelRetest = true
+                }
+                return
+            }
+        }
+
         if isTunnelTestInFlight {
             if force {
                 pendingForcedTunnelRetest = true
@@ -203,50 +221,55 @@ final class SharedLocationMapState: ObservableObject {
 
         isTunnelTestInFlight = true
         lastTunnelTestAt = now
-        tunnelConnection?.cancel()
         isTunnelReachable = nil
+
         let connection = NWConnection(
             host: NWEndpoint.Host(DeviceConnectionContext.targetIPAddress),
             port: 49152,
             using: .tcp
         )
         tunnelConnection = connection
+
         connection.stateUpdateHandler = { [weak self, weak connection] state in
             DispatchQueue.main.async {
                 guard let self, let connection, self.tunnelConnection === connection else { return }
                 switch state {
                 case .ready:
                     self.isTunnelReachable = true
-                    connection.cancel()
-                    self.finishTunnelTest(using: connection)
-                case .failed:
+                    self.lastTunnelSuccessAt = Date()
+                    self.isTunnelTestInFlight = false
+                    if self.pendingForcedTunnelRetest {
+                        self.pendingForcedTunnelRetest = false
+                    }
+                case .failed, .cancelled:
                     self.isTunnelReachable = false
-                    connection.cancel()
-                    self.finishTunnelTest(using: connection)
+                    self.tunnelConnection = nil
+                    self.isTunnelTestInFlight = false
+                    if self.pendingForcedTunnelRetest {
+                        self.pendingForcedTunnelRetest = false
+                        DispatchQueue.main.async { [weak self] in
+                            self?.testTunnel(force: true)
+                        }
+                    }
                 default: break
                 }
             }
         }
+
         connection.start(queue: DispatchQueue(label: "com.ufogeo.startup-tunnel"))
+
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self, weak connection] in
             guard let self, let connection,
                   self.tunnelConnection === connection,
                   self.isTunnelReachable == nil else { return }
             self.isTunnelReachable = false
+            self.tunnelConnection = nil
+            self.isTunnelTestInFlight = false
             connection.cancel()
-            self.finishTunnelTest(using: connection)
-        }
-    }
-
-    private func finishTunnelTest(using connection: NWConnection) {
-        guard tunnelConnection === connection else { return }
-        tunnelConnection = nil
-        isTunnelTestInFlight = false
-
-        guard pendingForcedTunnelRetest else { return }
-        pendingForcedTunnelRetest = false
-        DispatchQueue.main.async { [weak self] in
-            self?.testTunnel(force: true)
+            if self.pendingForcedTunnelRetest {
+                self.pendingForcedTunnelRetest = false
+                self.testTunnel(force: true)
+            }
         }
     }
 }

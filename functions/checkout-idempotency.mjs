@@ -1,6 +1,7 @@
 import {validateEntitlementGrant} from "./entitlement-resolver.mjs";
 import {isPortalyMode} from "./portaly-mode.mjs";
 import {paymentStateProjection} from "./subscription-response.mjs";
+import {RECOVERY_LOCK_STATUS} from "./subscription-recovery.mjs";
 
 export function hasBlockingSubscription(subscription = {}, {mode} = {}) {
   if (!subscription || typeof subscription !== "object" || Array.isArray(subscription)) {
@@ -395,6 +396,19 @@ export function checkoutLeaseDecision({
   const candidates = [emailLock, lock, legacyLock, ...legacyCandidates]
     .filter((candidate, index, values) => candidate && values.indexOf(candidate) === index);
   const allCandidates = [...candidates, fallbackSession];
+
+  // Email recovery is a read-only provider lookup, but its final transaction
+  // binds the result to the new Firebase UID. Keep a live recovery lease from
+  // racing this checkout transaction. An expired lease may be replaced; the
+  // recovery transaction verifies its owner again before writing.
+  for (const candidate of candidates) {
+    if (candidate?.status !== RECOVERY_LOCK_STATUS) continue;
+    const leaseExpiresAtMs = Number(candidate.leaseExpiresAtMs);
+    if (!Number.isFinite(leaseExpiresAtMs)) {
+      return {kind: "safety_hold", status: "recovery_state_unknown"};
+    }
+    if (leaseExpiresAtMs > now) return {kind: "in_progress"};
+  }
 
   for (const candidate of candidates) {
     const currentCheckoutSessionId = subscription?.currentCheckoutSessionId;

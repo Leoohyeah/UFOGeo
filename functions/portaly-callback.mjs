@@ -274,6 +274,11 @@ export function eventIdentity(payload) {
     const orderId = nonBlankString(payload.orderId);
     return orderId ? `${canonicalEventName(payload.event)}:${orderId}` : null;
   }
+  case "creator_subscription.active":
+  case "creator_subscription.cancel_requested":
+  case "creator_subscription.canceled":
+    // Lifecycle events are idempotent and don't need deduplication
+    return null;
   default:
     return null;
   }
@@ -359,7 +364,19 @@ export function shouldApplyCallbackUpdate(current = {}, incoming = {}, eventTime
   return true;
 }
 
-export function subscriptionStateForEvent(event, payload) {
+export function subscriptionStateForEvent(event, payload = {}) {
+  const baseState = getBaseSubscriptionStateForEvent(event, payload);
+  
+  // Optionally include nextBillingAt if provided in the payload
+  const nextBillingAt = optionalNullablePayloadField(payload, "nextBillingAt");
+  if (nextBillingAt !== undefined) {
+    baseState.nextBillingAt = nextBillingAt;
+  }
+  
+  return baseState;
+}
+
+function getBaseSubscriptionStateForEvent(event, payload) {
   switch (canonicalEventName(event)) {
   case "creator_subscription.checkout.completed":
     return {proActive: true, subscriptionStatus: "active", cancelAtPeriodEnd: false};
@@ -381,4 +398,14 @@ export function subscriptionStateForEvent(event, payload) {
   default:
     throw new CallbackError(400, "Unsupported callback event");
   }
+}
+
+function optionalNullablePayloadField(payload, field) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return undefined;
+  }
+  if (!(field in payload)) {
+    return undefined;
+  }
+  return payload[field];
 }

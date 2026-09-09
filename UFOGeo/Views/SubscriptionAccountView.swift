@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct SubscriptionAccountView: View {
+    private static let initialSyncRetryDelayNanoseconds: UInt64 = 1_000_000_000
     private static let privacyPolicyURL = URL(
         string: "https://ufogeo-adac7.web.app/privacy/"
     )!
@@ -28,9 +29,11 @@ struct SubscriptionAccountView: View {
     @State private var initialSubscriptionSyncCompleted = false
     @State private var initialSubscriptionSyncFailed = false
     @State private var initialSubscriptionSyncInFlight = false
-    private static let initialSyncRetryDelayNanoseconds: UInt64 = 1_000_000_000
 
     var body: some View {
+        // Intentionally avoid lifecycle-triggered sync here. This screen is a
+        // read/write surface only; refreshes are driven by explicit user actions
+        // or the app-owned auth/session sync path, not by view appearance.
         Form {
             if let session = auth.session {
                 signedInSection(session)
@@ -46,8 +49,14 @@ struct SubscriptionAccountView: View {
         .disabled(isBusy)
         .overlay {
             if isBusy {
-                ProgressView()
-                    .controlSize(.large)
+                VStack(spacing: 10) {
+                    ProgressView()
+                        .controlSize(.large)
+                    Text(busyStatusMessage)
+                        .font(.subheadline.weight(.medium))
+                        .multilineTextAlignment(.center)
+                        .foregroundStyle(.secondary)
+                }
                     .padding(28)
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
             }
@@ -68,12 +77,6 @@ struct SubscriptionAccountView: View {
             Button("取消", role: .cancel) { }
         } message: {
             Text("會員帳號和個人資料將永久刪除。若目前有 Pro 方案，系統會先停止下期續訂；刪除後將立即無法使用會員功能。依法必須保存的付款紀錄仍會保留。尚待確認的付款流程不會在此被取消，且可能暫時阻止帳號刪除。")
-        }
-        .task(id: auth.session?.uid) {
-            initialSubscriptionSyncCompleted = false
-            initialSubscriptionSyncFailed = false
-            guard let uid = auth.session?.uid else { return }
-            await refreshInitialAccountAndSubscription(expectedUID: uid)
         }
     }
 
@@ -179,6 +182,23 @@ struct SubscriptionAccountView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
+            if let expiringStage = portaly.subscription?.expiringStage {
+                let (alertText, alertColor, alertIcon) = expiringStageAlert(expiringStage)
+                if !alertText.isEmpty {
+                    Label(alertText, systemImage: alertIcon)
+                        .font(.caption)
+                        .foregroundStyle(alertColor)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            if let recoveryStatusMessage = portaly.recoveryStatusMessage {
+                Label(recoveryStatusMessage, systemImage: portaly.recoveryStatusIcon)
+                    .font(.caption)
+                    .foregroundStyle(recoveryStatusColor)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             ForEach(Array(membershipProjection.notices.enumerated()), id: \.offset) { _, notice in
                 let style = noticeStyle(for: notice.kind)
                 Label(notice.text, systemImage: style.icon)
@@ -193,7 +213,18 @@ struct SubscriptionAccountView: View {
                     .foregroundStyle(.secondary)
             }
 
-            if membershipProjection.action.opensCheckout {
+            if portaly.shouldOfferSubscriptionRecovery {
+                Button {
+                    Task { await recoverExistingSubscription() }
+                } label: {
+                    Label(recoveryActionTitle, systemImage: "arrow.uturn.backward.circle")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+            }
+
+            if membershipProjection.action.opensCheckout && !portaly.recoveryBlocksCheckout {
                 Button {
                     Task {
                         do {
@@ -355,6 +386,7 @@ struct SubscriptionAccountView: View {
             || portaly.isLoading
             || portaly.isCheckoutRequestInFlight
             || portaly.isPortalRequestInFlight
+            || portaly.isRecoveryRequestInFlight
             || initialSubscriptionSyncInFlight
     }
 
@@ -374,12 +406,73 @@ struct SubscriptionAccountView: View {
         }
     }
 
+    private var recoveryStatusColor: Color {
+        switch portaly.recoveryState {
+        case .recovered, .alreadyBound:
+            return .green
+        case .inFlight:
+            return .blue
+        case .notFound:
+            return .secondary
+        case .ambiguous, .unavailable, .conflict:
+            return .orange
+        case .idle:
+            return .secondary
+        }
+    }
+
+    private var busyStatusMessage: String {
+        if portaly.isRecoveryRequestInFlight {
+            return "正在從 Portaly 恢復…"
+        }
+        if initialSubscriptionSyncInFlight || portaly.isLoading {
+            return "正在確認最新會員狀態…"
+        }
+        if portaly.isCheckoutRequestInFlight {
+            return "正在建立付款頁面…"
+        }
+        if portaly.isPortalRequestInFlight {
+            return "正在開啟訂閱管理…"
+        }
+        return "請稍候…"
+    }
+
     private func noticeStyle(
         for kind: PortalyCheckoutService.MembershipProjection.Notice.Kind
     ) -> (icon: String, color: Color) {
         switch kind {
         case .grant: ("checkmark.seal.fill", .green)
         case .cancellation: ("calendar.badge.clock", .orange)
+        }
+    }
+
+    private func expiringStageAlert(_ stage: String) -> (text: String, color: Color, icon: String) {
+        let daysUntil = portaly.subscription?.daysUntilRenewal ?? 0
+        let days = Int(ceil(daysUntil))
+        
+        switch stage {
+        case "today":
+            let daysText = days == 0 ? "今天" : "\(days) 天內"
+            return (
+                text: "Pro 訂閱將於 \(daysText)到期或續訂。請確認付款方式有效。",
+                color: .red,
+                icon: "exclamationmark.circle.fill"
+            )
+        case "soon":
+            let daysText = days == 1 ? "1 天" : "\(days) 天"
+            return (
+                text: "Pro 訂閱將在 \(daysText)後到期。請確認付款方式有效，避免中斷。",
+                color: .orange,
+                icon: "exclamationmark.triangle.fill"
+            )
+        case "far":
+            return (
+                text: "Pro 訂閱即將到期；系統將於到期日期進行續訂。",
+                color: .yellow,
+                icon: "info.circle"
+            )
+        default:
+            return (text: "", color: .secondary, icon: "")
         }
     }
 
@@ -399,6 +492,17 @@ struct SubscriptionAccountView: View {
         return membershipProjection.action.title ?? "訂閱 UFOGeo Pro"
     }
 
+    private var recoveryActionTitle: String {
+        switch portaly.recoveryState {
+        case .notFound:
+            return "再次尋找既有訂閱"
+        case .ambiguous, .unavailable, .conflict:
+            return "重新嘗試恢復訂閱"
+        default:
+            return "從 Portaly 恢復既有訂閱"
+        }
+    }
+
     private func submitCredentials() async {
         do {
             switch entryMode {
@@ -410,7 +514,10 @@ struct SubscriptionAccountView: View {
                     return
                 }
                 try await auth.register(email: email, password: password)
-                present("帳號已建立", "驗證信已寄出。完成驗證後即可開始訂閱。")
+                present(
+                    "帳號已建立",
+                    "驗證信已寄出。完成驗證後，若你曾用這個 Email 在 Portaly 付款，系統會協助恢復既有 Pro 訂閱，不需要重新付款。"
+                )
             }
             password = ""
             passwordConfirmation = ""
@@ -433,8 +540,13 @@ struct SubscriptionAccountView: View {
             if auth.session?.emailVerified != true {
                 try await auth.reloadAccount(force: forceAuthReload)
             }
+            guard expectedUID == nil || auth.session?.uid == expectedUID else { return }
             _ = try await portaly.refreshSubscription(force: force)
             guard expectedUID == nil || auth.session?.uid == expectedUID else { return }
+            if portaly.shouldAttemptAutomaticSubscriptionRecovery {
+                _ = try await portaly.recoverSubscription()
+                guard expectedUID == nil || auth.session?.uid == expectedUID else { return }
+            }
             if force {
                 initialSubscriptionSyncCompleted = true
                 initialSubscriptionSyncFailed = false
@@ -476,6 +588,50 @@ struct SubscriptionAccountView: View {
             guard auth.session?.uid == expectedUID else { return }
             if initialSubscriptionSyncCompleted { return }
         }
+    }
+
+    private func recoverExistingSubscription() async {
+        guard let expectedUID = auth.session?.uid else { return }
+        do {
+            let outcome = try await portaly.recoverSubscription(force: true)
+            guard auth.session?.uid == expectedUID else { return }
+            initialSubscriptionSyncCompleted = true
+            initialSubscriptionSyncFailed = false
+            switch outcome {
+            case .recovered:
+                present(
+                    "Pro 訂閱已恢復",
+                    "已將既有 Portaly Pro 訂閱綁定到目前 UFOGeo 帳號，不需要重新付款。"
+                )
+            case .alreadyBound:
+                present(
+                    "訂閱已確認",
+                    "目前 UFOGeo 帳號已綁定既有 Portaly 訂閱，不需要重新付款。"
+                )
+            case .notFound:
+                present(
+                    "沒有找到既有訂閱",
+                    "目前沒有符合此 Email、付款環境與方案的有效 Portaly Pro 訂閱。若要使用 Pro，可以開始新的訂閱。"
+                )
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            guard auth.session?.uid == expectedUID else { return }
+            // The service records ambiguous, conflicting, and unavailable
+            // recovery as checkout-blocking states. Keep the user-facing
+            // error explicit so they do not mistake it for a payment failure.
+            present("無法恢復既有訂閱", recoveryErrorMessage(for: error))
+        }
+    }
+
+    private func recoveryErrorMessage(for error: Error) -> String {
+        if let statusMessage = portaly.recoveryStatusMessage,
+           portaly.recoveryState != .inFlight,
+           portaly.recoveryState != .notFound {
+            return statusMessage
+        }
+        return userFacingErrorMessage(error)
     }
 
     private func deleteMemberAccount() async {

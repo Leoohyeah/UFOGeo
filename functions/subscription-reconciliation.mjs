@@ -225,9 +225,9 @@ export function reconciledSubscriptionState({
   );
   const expectedPortalyMode = expectedMode === undefined || expectedMode === null ? undefined :
     validateMode(expectedMode, "EXPECTED_MODE_INVALID", "expected mode");
-  const expectedPortalyPlanId = validateExpected(
+  const expectedPortalyPlanId = requiredString(
     expectedPlanId,
-    "EXPECTED_PLAN_ID_INVALID",
+    "EXPECTED_PLAN_ID_REQUIRED",
     "expected plan ID",
   );
   const value = unwrapSubscriptionResponse(remote);
@@ -283,7 +283,7 @@ export function reconciledSubscriptionState({
   if (expectedPortalyPlanId && currentPlanId && currentPlanId !== expectedPortalyPlanId) {
     fail("CURRENT_PLAN_ID_MISMATCH", "Current user plan does not match the configured plan");
   }
-  if (expectedPortalyPlanId && remotePlanId !== expectedPortalyPlanId) {
+  if (remotePlanId !== expectedPortalyPlanId) {
     fail("SUBSCRIPTION_PLAN_MISMATCH", "Portaly subscription plan does not match the configured plan");
   }
   if (currentPlanId && remotePlanId !== currentPlanId) {

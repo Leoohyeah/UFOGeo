@@ -121,6 +121,9 @@ export function validateEntitlementGrant(grant, {now = Date.now()} = {}) {
   if (expiresAtMs !== null && expiresAtMs <= grantedAtMs) {
     return invalid("ENTITLEMENT_GRANT_PERIOD_INVALID", "Entitlement grant expiration must follow grantedAt");
   }
+  if (expiresAtMs !== null && expiresAtMs <= nowMs) {
+    return invalid("ENTITLEMENT_GRANT_EXPIRED", "Entitlement grant has expired");
+  }
 
   const grantedBy = nonBlankString(grant.grantedBy);
   if (!grantedBy) {
