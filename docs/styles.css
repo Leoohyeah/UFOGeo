@@ -100,22 +100,14 @@
     .step h3{font-size:20px;margin:10px 0}
     .step p{color:var(--muted);font-size:14px;line-height:1.7}
     .install-guide .step{height:100%}
-    .install-guide .install-links{margin-top:14px}
-    .install-guide .install-links li{
-      display:block;
-      position:relative;
-      padding-left:24px;
-      line-height:1.75;
-    }
-    .install-guide .install-links li:before{
-      position:absolute;
-      left:0;
-      top:.18em;
-      line-height:1;
-    }
+    .step01-prep-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:18px;min-width:0}
+    .step01-prep-group{min-width:0;padding:16px;border:1px solid rgba(119,219,255,.14);border-radius:16px;background:rgba(2,9,21,.32)}
+    .step01-prep-label{margin:0;color:#eafaff;font-size:16px;font-weight:800;letter-spacing:.01em}
+    .step01-prep-description{margin:8px 0 14px;color:#c7d8e8;font-size:14px;line-height:1.7;overflow-wrap:anywhere;word-break:normal}
+    .step01-prep-links{display:flex;flex-wrap:wrap;align-items:flex-start;gap:8px;min-width:0}
+    .step01-prep-link{display:inline-flex;align-items:center;justify-content:center;min-width:0;max-width:100%;padding:7px 10px;border:1px solid rgba(102,234,255,.22);border-radius:10px;background:rgba(66,239,255,.08);color:var(--cyan);font-size:14px;line-height:1.45;text-align:center;text-decoration:underline;text-underline-offset:3px;white-space:normal;overflow-wrap:anywhere;word-break:normal}
     .install-guide .install-list{margin:14px 0 0;padding-left:22px;display:grid;gap:8px;color:#c7d8e8;font-size:14px;line-height:1.7}
     .install-guide .install-list a,
-    .install-guide .install-links a,
     .install-guide .platform-card a{color:var(--cyan);text-decoration:underline;text-underline-offset:3px}
     .platforms{display:grid;grid-template-columns:1fr 1fr;gap:18px}
     .platform-card h3{font-size:24px;margin:0 0 14px}
@@ -200,6 +192,7 @@
       .app-icon{max-width:330px}
       .grid-5{grid-template-columns:repeat(2,1fr)}
       .steps{grid-template-columns:repeat(2,1fr)}
+      .step01-prep-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
       .plan-highlight{align-items:flex-start;flex-direction:column;gap:12px}
     }
     @media(max-width:700px){
@@ -208,6 +201,7 @@
       .hero{padding-top:44px}
       h1{font-size:54px;letter-spacing:-2px}
       .grid-5,.steps,.platforms,.plan-highlights,.legal-grid{grid-template-columns:1fr}
+      .step01-prep-grid{grid-template-columns:1fr}
       .section{padding:64px 0}
       .nav-cta{padding:9px 12px}
       .plan-highlight{padding:21px}
