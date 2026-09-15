@@ -13,6 +13,7 @@ const ACTIVE_SUBSCRIPTION_STATUSES = new Set([
 const PORTALY_SUBSCRIPTION_STATUSES = new Set([
   "active",
   "past_due",
+  "cancel_requested",
   "canceled",
 ]);
 
@@ -264,6 +265,19 @@ export function deletedAccountCallbackNeedsCancellation({
   return accountDeleted === true &&
     ["active", "past_due"].includes(subscriptionStatus) &&
     cancelAtPeriodEnd !== true;
+}
+
+/**
+ * Account-deletion finalization has already passed the local checkout guard.
+ * Once the verified Portaly list has no renewable subscription, there is no
+ * provider renewal to protect and the email lock can be removed.  A complete
+ * account-deletion tombstone remains the safety proof for older records while
+ * their bounded hold is still active.
+ */
+export function accountDeletionCanSkipCustomerTombstone({
+  providerHasRenewableSubscription = false,
+} = {}) {
+  return providerHasRenewableSubscription !== true;
 }
 
 export function completedAccountDeletionMatches(

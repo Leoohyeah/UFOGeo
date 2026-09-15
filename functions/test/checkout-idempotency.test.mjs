@@ -6,11 +6,13 @@ import {
   callbackModeMatchesDeployment,
   callbackModeMatchesSession,
   CHECKOUT_UNCERTAIN_HOLD_MS,
+  canReuseOrphanLockSnapshot,
   classifyCheckoutCreationResult,
   checkoutEntitlementGrantDecision,
   checkoutLockDocumentId,
   checkoutLockMatchesSession,
   checkoutLeaseDecision,
+  checkoutSessionReuseDecision,
   hasBlockingSubscription,
   isReusableCheckoutSession,
   shouldApplyUserSubscriptionUpdate,
@@ -983,6 +985,200 @@ test("invalidates only the matching lock so checkout failure can be retried", ()
   );
 });
 
+test("authoritative terminal checkout sessions invalidate stale reusable locks", () => {
+  const planId = "JO5cmDQdqTtb6AkkcnNW";
+  const now = Date.parse("2026-08-26T04:00:00.000Z");
+  const lock = {
+    uid: "user-A",
+    planId,
+    mode: "live",
+    status: "checkout_ready",
+    sessionId: "session-stale",
+    checkoutUrl: "https://example.com/checkout/stale",
+    expiresAt: now + 60_000,
+  };
+  const terminalSession = {
+    uid: "user-A",
+    planId,
+    mode: "live",
+    sessionId: "session-stale",
+    status: "checkout_failed",
+    providerStatus: "checkout_ready",
+  };
+
+  assert.deepEqual(checkoutSessionReuseDecision(lock, {
+    authoritativeSessions: new Map([[
+      lock.sessionId,
+      terminalSession,
+    ]]),
+    uid: "user-A",
+    planId,
+    mode: "live",
+    now,
+  }), {kind: "terminal"});
+  assert.deepEqual(checkoutLeaseDecision({
+    subscription: {
+      mode: "live",
+      proActive: false,
+      subscriptionStatus: "checkout_failed",
+      currentCheckoutSessionId: lock.sessionId,
+      planId,
+      cancelAtPeriodEnd: false,
+    },
+    emailLock: lock,
+    authoritativeSessions: new Map([[
+      lock.sessionId,
+      terminalSession,
+    ]]),
+    uid: "user-A",
+    planId,
+    mode: "live",
+    now,
+  }), {kind: "acquire"});
+});
+
+test("authoritative pending and uncertain sessions remain protected", () => {
+  const planId = "JO5cmDQdqTtb6AkkcnNW";
+  const now = Date.parse("2026-08-26T04:00:00.000Z");
+  const lock = {
+    uid: "user-A",
+    planId,
+    mode: "live",
+    status: "checkout_ready",
+    sessionId: "session-pending",
+    checkoutUrl: "https://example.com/checkout/pending",
+    expiresAt: now + 60_000,
+  };
+  const base = {
+    uid: "user-A",
+    planId,
+    mode: "live",
+    sessionId: lock.sessionId,
+  };
+
+  assert.deepEqual(checkoutLeaseDecision({
+    subscription: {},
+    emailLock: lock,
+    authoritativeSessions: new Map([[
+      lock.sessionId,
+      {...base, status: "checkout_ready"},
+    ]]),
+    uid: "user-A",
+    planId,
+    mode: "live",
+    now,
+  }), {kind: "reuse", session: lock});
+  assert.deepEqual(checkoutLeaseDecision({
+    subscription: {},
+    emailLock: lock,
+    authoritativeSessions: new Map([[
+      lock.sessionId,
+      {...base, status: "response_incomplete"},
+    ]]),
+    uid: "user-A",
+    planId,
+    mode: "live",
+    now,
+  }), {kind: "safety_hold", status: "response_incomplete"});
+});
+
+test("authoritative paid, missing, and mismatched sessions fail closed", () => {
+  const planId = "JO5cmDQdqTtb6AkkcnNW";
+  const now = Date.parse("2026-08-26T04:00:00.000Z");
+  const lock = {
+    uid: "user-A",
+    planId,
+    mode: "live",
+    status: "checkout_ready",
+    sessionId: "session-paid",
+    checkoutUrl: "https://example.com/checkout/paid",
+    expiresAt: now + 60_000,
+  };
+  const decision = (entry) => checkoutLeaseDecision({
+    subscription: {},
+    emailLock: lock,
+    authoritativeSessions: new Map([[lock.sessionId, entry]]),
+    uid: "user-A",
+    planId,
+    mode: "live",
+    now,
+  });
+
+  assert.deepEqual(decision({...lock, status: "active"}), {kind: "blocked"});
+  assert.deepEqual(decision(null), {
+    kind: "safety_hold",
+    status: "checkout_session_state_unknown",
+  });
+  assert.deepEqual(decision({...lock, uid: "user-B", status: "checkout_ready"}), {
+    kind: "safety_hold",
+    status: "checkout_session_identity_mismatch",
+  });
+});
+
+test("a fallback session that becomes terminal is not reused", () => {
+  const planId = "JO5cmDQdqTtb6AkkcnNW";
+  const now = Date.parse("2026-08-26T04:00:00.000Z");
+  const fallbackSession = {
+    uid: "user-A",
+    planId,
+    mode: "live",
+    status: "checkout_ready",
+    sessionId: "session-raced",
+    checkoutUrl: "https://example.com/checkout/raced",
+    expiresAt: now + 60_000,
+  };
+
+  assert.deepEqual(checkoutLeaseDecision({
+    subscription: {
+      mode: "live",
+      proActive: false,
+      subscriptionStatus: "checkout_failed",
+      currentCheckoutSessionId: fallbackSession.sessionId,
+      planId,
+      cancelAtPeriodEnd: false,
+    },
+    fallbackSession,
+    authoritativeSessions: new Map([[
+      fallbackSession.sessionId,
+      {...fallbackSession, status: "expired"},
+    ]]),
+    uid: "user-A",
+    planId,
+    mode: "live",
+    now,
+  }), {kind: "acquire"});
+});
+
+test("releases terminal old-owner sessions but protects their pending sessions", () => {
+  const planId = "JO5cmDQdqTtb6AkkcnNW";
+  const now = Date.parse("2026-08-26T04:00:00.000Z");
+  const lock = {
+    uid: "user-A",
+    planId,
+    mode: "live",
+    status: "checkout_ready",
+    sessionId: "session-old-owner",
+    checkoutUrl: "https://example.com/checkout/old-owner",
+    expiresAt: now + 60_000,
+  };
+  const decide = (session) => checkoutLeaseDecision({
+    subscription: {},
+    emailLock: lock,
+    authoritativeSessions: new Map([[lock.sessionId, session]]),
+    uid: "user-B",
+    planId,
+    mode: "live",
+    now,
+  });
+
+  assert.deepEqual(decide({...lock, status: "checkout_failed"}), {kind: "acquire"});
+  assert.deepEqual(decide({...lock, status: "checkout_ready"}), {kind: "conflict"});
+  assert.deepEqual(decide({...lock, uid: "user-C", status: "checkout_failed"}), {
+    kind: "safety_hold",
+    status: "checkout_session_identity_mismatch",
+  });
+});
+
 test("does not let an older callback change the user's newer subscription", () => {
   assert.equal(
     shouldApplyUserSubscriptionUpdate({subscriptionId: "newer-session"}, "older-session"),
@@ -994,6 +1190,24 @@ test("does not let an older callback change the user's newer subscription", () =
   );
   assert.equal(shouldApplyUserSubscriptionUpdate({}, "first-session"), true);
   assert.equal(shouldApplyUserSubscriptionUpdate({}, ""), false);
+});
+
+test("only reuses a fetched orphan lock snapshot for the same reference", () => {
+  assert.equal(canReuseOrphanLockSnapshot({
+    orphanLockPath: "checkoutLocks/customer-1",
+    refPath: "checkoutLocks/customer-1",
+    snapshotFetched: false,
+  }), false);
+  assert.equal(canReuseOrphanLockSnapshot({
+    orphanLockPath: "checkoutLocks/customer-1",
+    refPath: "checkoutLocks/customer-1",
+    snapshotFetched: true,
+  }), true);
+  assert.equal(canReuseOrphanLockSnapshot({
+    orphanLockPath: "checkoutLocks/customer-1",
+    refPath: "checkoutLocks/session-1",
+    snapshotFetched: true,
+  }), false);
 });
 
 test("prefers the current checkout id after a failed checkout clears subscriptionId", () => {
@@ -1060,6 +1274,18 @@ test("matches callbacks only to the configured checkout identity", () => {
   const options = {expectedPlanId: "plan-pro"};
 
   assert.equal(callbackMatchesCheckoutSession(session, payload, options), true);
+  assert.equal(
+    callbackMatchesCheckoutSession(session, {...payload, subscriptionId: undefined}, options),
+    true,
+  );
+  for (const invalidPayload of [
+    {...payload, subscriptionId: undefined, sessionId: "session-2"},
+    {...payload, subscriptionId: undefined, planId: "other-plan"},
+    {...payload, subscriptionId: undefined, customerEmail: "other@example.com"},
+    {...payload, subscriptionId: undefined, mode: "test"},
+  ]) {
+    assert.equal(callbackMatchesCheckoutSession(session, invalidPayload, options), false);
+  }
   for (const invalidPayload of [
     {...payload, sessionId: "session-2", subscriptionId: "session-2"},
     {...payload, planId: "other-plan"},

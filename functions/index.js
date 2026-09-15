@@ -35,6 +35,7 @@ import {
   callbackMatchesCheckoutSession,
   callbackModeMatchesDeployment,
   CHECKOUT_UNCERTAIN_HOLD_MS,
+  canReuseOrphanLockSnapshot,
   classifyCheckoutCreationResult,
   checkoutEntitlementGrantDecision,
   checkoutLockMatchesSession,
@@ -43,6 +44,10 @@ import {
   isReusableCheckoutSession,
   shouldApplyUserSubscriptionUpdate,
 } from "./checkout-idempotency.mjs";
+import {
+  inspectDeletedCheckoutProvider,
+  runDeletedCheckoutLease,
+} from "./deleted-checkout-recovery.mjs";
 import {
   checkoutReconciliationOrchestrationResult,
   checkoutSessionReconciliationTarget,
@@ -56,10 +61,12 @@ import {
   orphanCheckoutSessionRecord,
 } from "./orphan-callback-recovery.mjs";
 import {
+  deletedAccountRefundOutcome,
   refundReconciliationDecision,
   refundReconciliationLeaseMatches,
 } from "./refund-reconciliation-state.mjs";
 import {
+  accountDeletionCanSkipCustomerTombstone,
   accountDeletionTombstoneWrite,
   accountDeletionGuardDecision,
   completedAccountDeletionMatches,
@@ -77,6 +84,11 @@ import {
   normalizeCustomerEmail,
   portalySubscriptions,
 } from "./customer-subscription-guard.mjs";
+import {
+  deletedAccountCompensationOwnershipDecision,
+  subscriptionOwnerQueryEntry,
+  subscriptionRecoveryOwnershipTransaction,
+} from "./subscription-ownership.mjs";
 import {
   reconcileSubscription as buildReconciliationPatches,
   SubscriptionReconciliationError,
@@ -105,6 +117,7 @@ import {
   recoveryLockDecision,
   recoveryResponseData,
   recoveryResponseEnvelope,
+  recoveryProviderDetailDecision,
   selectRecoverableSubscription,
 } from "./subscription-recovery.mjs";
 
@@ -119,7 +132,6 @@ const PROJECT_ID = "ufogeo-adac7";
 const PUBLIC_BASE_URL = `https://${PROJECT_ID}.web.app`;
 const SUPPORT_EMAIL = "leoohyeah.app@gmail.com";
 const PORTALY_PLAN_ID = "JO5cmDQdqTtb6AkkcnNW";
-const PORTALY_SKILL_VERSION = "0.11.3";
 const API_HOST = (process.env.PORTALY_API_HOST || "https://portaly.ai").replace(/\/$/, "");
 const MAX_BODY_BYTES = 128 * 1024;
 const CHECKOUT_LEASE_MS = 60 * 1000;
@@ -202,6 +214,13 @@ function requireEmptyJsonBody(request) {
 
 function requireFirebaseUser(request, options = {}) {
   return authenticateFirebaseUser(request, {auth, ...options});
+}
+
+function checkoutSessionLookupId(value) {
+  const sessionId = nonBlankString(value);
+  return sessionId && sessionId !== "." && sessionId !== ".." &&
+    !sessionId.includes("/") && Buffer.byteLength(sessionId, "utf8") <= 1500 ?
+    sessionId : null;
 }
 
 function reportSkillVersion(apiKey) {
@@ -339,6 +358,77 @@ async function holdUncertainCheckout({
   });
 }
 
+/**
+ * Inject the Portaly adapter into the shared, Firebase-free tombstone policy.
+ */
+async function inspectAccountDeletionProvider({apiKey, user, mode} = {}) {
+  return inspectDeletedCheckoutProvider({
+    fetchSubscriptions: () => {
+      reportSkillVersion(apiKey);
+      return listCustomerSubscriptions({apiKey, customerEmail: user.email});
+    },
+    selectCandidate: (subscriptions) => selectRecoverableSubscription(subscriptions, {
+      email: user.email,
+      planId: PORTALY_PLAN_ID,
+      mode,
+    }),
+    fetchDetail: async (candidate) => {
+      const result = await portalyRequest(
+        `/api/creator-subscription/subscriptions/${encodeURIComponent(candidate.id)}`,
+        {apiKey},
+      );
+      if (!result.response.ok) {
+        throw Object.assign(new Error("Portaly subscription detail request failed"), {
+          portalyStatus: result.response.status,
+          portalyCode: result.payload?.code || null,
+        });
+      }
+      return result.payload;
+    },
+    decodeDetail: (payload, candidate) => recoveredSubscriptionState({
+      remote: payload,
+      subscriptionId: candidate.id,
+      email: user.email,
+      planId: PORTALY_PLAN_ID,
+      mode,
+    }),
+    classifyDetail: (recovered) => {
+      const detailDecision = recoveryProviderDetailDecision({
+        recoverable: recovered.recoverable,
+        subscriptionStatus: recovered.state.subscriptionStatus,
+      });
+      return detailDecision.kind === "not_found" ?
+        {kind: "terminal"} : detailDecision.kind === "recoverable" ?
+          {kind: "renewable"} : {kind: "uncertain", stage: "state_changed"};
+    },
+  });
+}
+
+/**
+ * Remove a completed account-deletion tombstone only after the shared
+ * provider inspection found no renewable subscription. The delete is a
+ * compare-and-set in Firestore; a concurrent recovery/deletion leaves the
+ * newer state untouched.
+ */
+async function clearAccountDeletionTombstoneCAS({lockRef, mode} = {}) {
+  return db.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(lockRef);
+    if (!snapshot.exists) return true;
+    const lock = snapshot.data() || {};
+    const safetyHoldUntilMs = Number(lock.safetyHoldUntilMs);
+    const completeTombstone = lock.status === "account_deleted" &&
+      lock.planId === PORTALY_PLAN_ID &&
+      lock.mode === mode &&
+      typeof lock.accountUidHash === "string" &&
+      lock.accountUidHash.trim().length > 0 &&
+      !Object.prototype.hasOwnProperty.call(lock, "uid") &&
+      Number.isFinite(safetyHoldUntilMs);
+    if (!completeTombstone) return false;
+    transaction.delete(lockRef);
+    return true;
+  });
+}
+
 async function preserveCheckoutSession(sessionRef, sessionRecord) {
   await db.runTransaction(async (transaction) => {
     const sessionSnapshot = await transaction.get(sessionRef);
@@ -383,48 +473,66 @@ async function createCheckout(request, response) {
   const leaseId = randomUUID();
   const merchantOrderNumber = `ufogeo-${user.uid.slice(0, 10)}-${now}-${randomUUID().slice(0, 8)}`;
 
-  const decision = await db.runTransaction(async (transaction) => {
-    const transactionNow = Date.now();
-    const reads = [
-      transaction.get(userRef),
-      transaction.get(grantRef),
-      transaction.get(lockRef),
-      ...legacyLockRefs.map((ref) => transaction.get(ref)),
-    ];
-    const [userSnapshot, grantSnapshot, lockSnapshot, ...legacyLockSnapshots] = await Promise.all(reads);
-    const grantDecision = checkoutEntitlementGrantDecision(
-      grantSnapshot.exists ? grantSnapshot.data() : null,
-      {now: transactionNow},
-    );
-    if (grantDecision.kind !== "allow") return grantDecision;
-    const value = checkoutLeaseDecision({
-      subscription: userSnapshot.data() || {},
-      emailLock: lockSnapshot.data() || null,
-      legacyLocks: legacyLockSnapshots.map((snapshot) => snapshot.data() || null),
-      fallbackSession,
-      uid: user.uid,
-      planId: PORTALY_PLAN_ID,
-      mode,
-      now: transactionNow,
-    });
-
-    if (value.kind === "acquire") {
-      transaction.set(lockRef, {
+  const decision = await runDeletedCheckoutLease({
+    acquireLease: () => db.runTransaction(async (transaction) => {
+      const transactionNow = Date.now();
+      const reads = [
+        transaction.get(userRef),
+        transaction.get(grantRef),
+        transaction.get(lockRef),
+        ...legacyLockRefs.map((ref) => transaction.get(ref)),
+      ];
+      const [userSnapshot, grantSnapshot, lockSnapshot, ...legacyLockSnapshots] = await Promise.all(reads);
+      const lockRecords = [lockSnapshot.data() || null, ...legacyLockSnapshots.map((snapshot) =>
+        snapshot.data() || null)];
+      const sessionIds = [...new Set([
+        ...lockRecords.map((candidate) => checkoutSessionLookupId(candidate?.sessionId)),
+        checkoutSessionLookupId(fallbackSession?.sessionId),
+      ].filter(Boolean))];
+      const sessionRefs = sessionIds.map((sessionId) =>
+        db.collection("checkoutSessions").doc(sessionId));
+      const sessionSnapshots = await Promise.all(sessionRefs.map((ref) => transaction.get(ref)));
+      const authoritativeSessions = new Map(sessionRefs.map((ref, index) => [
+        ref.id,
+        sessionSnapshots[index].exists ? sessionSnapshots[index].data() : null,
+      ]));
+      const grantDecision = checkoutEntitlementGrantDecision(
+        grantSnapshot.exists ? grantSnapshot.data() : null,
+        {now: transactionNow},
+      );
+      if (grantDecision.kind !== "allow") return grantDecision;
+      const value = checkoutLeaseDecision({
+        subscription: userSnapshot.data() || {},
+        emailLock: lockSnapshot.data() || null,
+        legacyLocks: legacyLockSnapshots.map((snapshot) => snapshot.data() || null),
+        fallbackSession,
+        authoritativeSessions,
         uid: user.uid,
-        customerEmail: user.email,
         planId: PORTALY_PLAN_ID,
         mode,
-        status: "creating",
-        leaseId,
-        checkoutLeaseId: leaseId,
-        merchantOrderNumber,
-        leaseExpiresAtMs: transactionNow + CHECKOUT_LEASE_MS,
-        safetyHoldUntilMs: transactionNow + CHECKOUT_UNCERTAIN_HOLD_MS,
-        createdAt: FieldValue.serverTimestamp(),
-        updatedAt: FieldValue.serverTimestamp(),
+        now: transactionNow,
       });
-    }
-    return value;
+
+      if (value.kind === "acquire") {
+        transaction.set(lockRef, {
+          uid: user.uid,
+          customerEmail: user.email,
+          planId: PORTALY_PLAN_ID,
+          mode,
+          status: "creating",
+          leaseId,
+          checkoutLeaseId: leaseId,
+          merchantOrderNumber,
+          leaseExpiresAtMs: transactionNow + CHECKOUT_LEASE_MS,
+          safetyHoldUntilMs: transactionNow + CHECKOUT_UNCERTAIN_HOLD_MS,
+          createdAt: FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+      }
+      return value;
+    }),
+    inspectProvider: () => inspectAccountDeletionProvider({apiKey, user, mode}),
+    clearTombstone: () => clearAccountDeletionTombstoneCAS({lockRef, mode}),
   });
 
   if (decision.kind === "blocked") {
@@ -452,6 +560,12 @@ async function createCheckout(request, response) {
     });
   }
   if (decision.kind === "safety_hold") {
+    if (decision.status === "account_deleted") {
+      throw Object.assign(new Error("帳號刪除安全保護尚未完成，請稍後再試。"), {
+        statusCode: 409,
+        code: "ACCOUNT_DELETION_SAFETY_HOLD",
+      });
+    }
     throw Object.assign(new Error("先前付款建立結果尚未確認，為避免重複扣款，暫時無法建立新的付款流程。"), {
       statusCode: 409,
       code: "CHECKOUT_SAFETY_HOLD",
@@ -900,12 +1014,13 @@ async function reconcilePendingCheckoutForUser({user, initialUser, apiKey, expec
         user,
         ...options,
       }),
-      reconcileCompleted: async ({trustedLookupId}) => reconcilePortalySubscriptionForUser({
+      reconcileCompleted: async ({trustedLookupId, localSessionResolved = false}) => reconcilePortalySubscriptionForUser({
         user,
         initialUser,
         apiKey,
         expectedMode,
         trustedLookupId,
+        checkoutSessionResolved: localSessionResolved,
       }),
     });
     return checkoutReconciliationOrchestrationResult(result);
@@ -1096,6 +1211,7 @@ async function reconcilePortalySubscriptionForUser({
   apiKey,
   expectedMode,
   trustedLookupId = null,
+  checkoutSessionResolved = false,
 }) {
   const userRef = db.collection("users").doc(user.uid);
   const grantRef = entitlementGrantRef(user.uid);
@@ -1301,7 +1417,17 @@ async function reconcilePortalySubscriptionForUser({
         initialStateFingerprint.subscriptionStatus === "cancel_requested" &&
         userPatch.subscriptionStatus === "active" &&
         subscriptionStateMatchesPatch(current, userPatch);
-      if (accountStateChanged && !isResumeStateRace) {
+      const initialIdentifiers = [
+        initialStateFingerprint.subscriptionId,
+        initialStateFingerprint.currentCheckoutSessionId,
+      ].filter((value) => value !== null);
+      const isCheckoutCallbackRace =
+        checkoutSessionResolved === true &&
+        initialIdentifiers.every((value) => value === lookupId) &&
+        nonBlankString(current.currentCheckoutSessionId) === lookupId &&
+        nonBlankString(current.subscriptionId) === lookupId &&
+        subscriptionStateMatchesPatch(current, userPatch);
+      if (accountStateChanged && !isResumeStateRace && !isCheckoutCallbackRace) {
         throwReconciliationConflict(
           "ACCOUNT_STATE_CHANGED",
           "訂閱資料剛剛已變更，請重新整理後再試。",
@@ -1464,6 +1590,7 @@ const RECOVERY_AMBIGUITY_CODES = new Set([
 ]);
 const RECOVERY_CONFLICT_CODES = new Set([
   "ACCOUNT_DELETION_IN_PROGRESS",
+  "ACCOUNT_DELETION_TOMBSTONE_INVALID",
   "CHECKOUT_IN_PROGRESS",
   "CHECKOUT_SAFETY_HOLD",
   "EMAIL_RECOVERY_IN_PROGRESS",
@@ -1475,6 +1602,10 @@ const RECOVERY_CONFLICT_CODES = new Set([
   "RECOVERY_LOCAL_STATE_INVALID",
   "RECOVERY_LOCK_SCOPE_CONFLICT",
   "RECOVERY_PROVIDER_STATE_RACE",
+  "RECOVERY_OWNER_CONTEXT_INVALID",
+  "RECOVERY_OWNER_SCOPE_CONFLICT",
+  "RECOVERY_OWNER_STATE_CONFLICT",
+  "RECOVERY_OWNER_STATE_INVALID",
   "RECOVERY_SESSION_EMAIL_CONFLICT",
   "RECOVERY_SESSION_IDENTITY_CONFLICT",
   "RECOVERY_SESSION_OWNERSHIP_CONFLICT",
@@ -1487,6 +1618,18 @@ function publicRecoveryError(error) {
     return Object.assign(
       new Error("找到多筆可用的 Portaly 訂閱，為避免誤綁定，請聯絡支援處理。"),
       {statusCode: 409, code: "SUBSCRIPTION_RECOVERY_AMBIGUOUS"},
+    );
+  }
+  if (internalCode === "ACCOUNT_DELETION_SAFETY_HOLD") {
+    return Object.assign(
+      new Error("帳號刪除安全保護尚未完成，請稍後再試。"),
+      {statusCode: 409, code: "ACCOUNT_DELETION_SAFETY_HOLD"},
+    );
+  }
+  if (internalCode === "SUBSCRIPTION_RECOVERY_SAFETY_HOLD") {
+    return Object.assign(
+      new Error("目前無法安全確認既有訂閱，為避免重複付款，請稍後再試。"),
+      {statusCode: 409, code: "SUBSCRIPTION_RECOVERY_SAFETY_HOLD"},
     );
   }
   if (RECOVERY_CONFLICT_CODES.has(internalCode)) {
@@ -1513,19 +1656,30 @@ function currentUserUidMatches(userData, uid) {
 
 function assertRecoverySessionIdentity(
   session,
-  {uid, email, planId, mode, subscriptionId, observedAtMs} = {},
+  {
+    uid,
+    email,
+    planId,
+    mode,
+    subscriptionId,
+    observedAtMs,
+    allowDeletedOwnership = false,
+  } = {},
 ) {
   if (!session || typeof session !== "object" || Array.isArray(session)) {
     recoveryError("RECOVERY_SESSION_STATE_INVALID", "Recovery checkout session is invalid", 502);
   }
-  if (session.uid !== undefined && session.uid !== null &&
-      (typeof session.uid !== "string" || session.uid !== uid) &&
-      session.accountDeleted !== true) {
-    recoveryError("RECOVERY_SESSION_OWNERSHIP_CONFLICT", "Recovery checkout session belongs to another account");
+  if (session.uid !== undefined && session.uid !== null) {
+    if (typeof session.uid !== "string") {
+      recoveryError("RECOVERY_SESSION_STATE_INVALID", "Recovery checkout session uid is invalid", 502);
+    }
+    if (session.uid !== uid &&
+        !(allowDeletedOwnership && session.accountDeleted === true)) {
+      recoveryError("RECOVERY_SESSION_OWNERSHIP_CONFLICT", "Recovery checkout session belongs to another account");
+    }
   }
-  if (session.uid !== undefined && session.uid !== null &&
-      typeof session.uid !== "string") {
-    recoveryError("RECOVERY_SESSION_STATE_INVALID", "Recovery checkout session uid is invalid", 502);
+  if (session.accountDeleted === true && !allowDeletedOwnership && session.uid !== uid) {
+    recoveryError("RECOVERY_SESSION_OWNERSHIP_CONFLICT", "Recovery checkout session belongs to another account");
   }
   if (session.customerEmail !== undefined && session.customerEmail !== null &&
       normalizeCustomerEmail(session.customerEmail) !== normalizeCustomerEmail(email)) {
@@ -1579,13 +1733,22 @@ function recoveryProviderPatch(
   return patch;
 }
 
-async function releaseSubscriptionRecovery(lockRef, recoveryId) {
+async function releaseSubscriptionRecovery(
+  lockRef,
+  recoveryId,
+  {restoreTombstone = null} = {},
+) {
   await db.runTransaction(async (transaction) => {
     const snapshot = await transaction.get(lockRef);
     const value = snapshot.data() || null;
     if (snapshot.exists && value?.status === RECOVERY_LOCK_STATUS &&
         value.recoveryId === recoveryId) {
-      transaction.delete(lockRef);
+      if (restoreTombstone && typeof restoreTombstone === "object" &&
+          !Array.isArray(restoreTombstone)) {
+        transaction.set(lockRef, restoreTombstone);
+      } else {
+        transaction.delete(lockRef);
+      }
     }
   });
 }
@@ -1630,7 +1793,8 @@ async function reserveSubscriptionRecovery({user, mode, subscriptionId, recovery
           "目前帳號已有不同的訂閱綁定，為避免覆蓋會員資料，暫時無法恢復。",
       );
     }
-    const lockDecision = recoveryLockDecision(lockSnapshot.exists ? lockSnapshot.data() : null, {
+    const previousLock = lockSnapshot.exists ? lockSnapshot.data() : null;
+    const lockDecision = recoveryLockDecision(previousLock, {
       planId: PORTALY_PLAN_ID,
       mode,
       now: Date.now(),
@@ -1639,7 +1803,9 @@ async function reserveSubscriptionRecovery({user, mode, subscriptionId, recovery
       recoveryError("EMAIL_RECOVERY_IN_PROGRESS", "會員恢復作業正在進行中，請稍候再試。");
     }
     if (lockDecision.kind === "conflict") {
-      const lockMessage = lockDecision.code === "CHECKOUT_SAFETY_HOLD" ?
+      const lockMessage = lockDecision.code === "ACCOUNT_DELETION_SAFETY_HOLD" ?
+        "帳號刪除安全保護尚未完成，請稍後再試。" :
+        lockDecision.code === "CHECKOUT_SAFETY_HOLD" ?
         "付款建立結果尚未確認，為避免重複扣款，暫時無法恢復會員。" :
         lockDecision.code === "PENDING_CHECKOUT_EXISTS" ||
         lockDecision.code === "CHECKOUT_IN_PROGRESS" ?
@@ -1659,103 +1825,87 @@ async function reserveSubscriptionRecovery({user, mode, subscriptionId, recovery
       leaseExpiresAtMs: now + RECOVERY_LEASE_MS,
       updatedAt: FieldValue.serverTimestamp(),
     };
+    if (lockDecision.kind === "reclaimable_tombstone") {
+      lockPatch.reclaimFromAccountUidHash = lockDecision.accountUidHash;
+    }
+    if (lockDecision.kind === "inspection_only_tombstone") {
+      lockPatch.inspectionOnlyTombstone = true;
+    }
     if (!lockSnapshot.exists) lockPatch.createdAt = FieldValue.serverTimestamp();
     transaction.set(lockRef, lockPatch, {merge: true});
-    return {lockRef, current, bindingKind: binding.kind};
+    return {
+      lockRef,
+      current,
+      bindingKind: binding.kind,
+      previousLock,
+      reclaimFromAccountUidHash: lockDecision.kind === "reclaimable_tombstone" ?
+        lockDecision.accountUidHash : null,
+      inspectionOnlyTombstone: lockDecision.kind === "inspection_only_tombstone",
+    };
   });
-  return {lockRef, current: reservation.current, bindingKind: reservation.bindingKind};
+  return {
+    lockRef,
+    current: reservation.current,
+    bindingKind: reservation.bindingKind,
+    previousLock: reservation.previousLock,
+    reclaimFromAccountUidHash: reservation.reclaimFromAccountUidHash,
+    inspectionOnlyTombstone: reservation.inspectionOnlyTombstone,
+  };
 }
 
-async function queryRecoverableSubscription({apiKey, user, mode}) {
-  reportSkillVersion(apiKey);
-  let customerSubscriptions;
-  try {
-    customerSubscriptions = await listCustomerSubscriptions({
-      apiKey,
-      customerEmail: user.email,
-    });
-  } catch (error) {
+async function queryRecoverableSubscription({apiKey, user, mode, reservation = null}) {
+  const inspection = await inspectAccountDeletionProvider({apiKey, user, mode});
+  if (inspection.kind === "terminal") {
+    if (reservation && typeof reservation === "object") {
+      reservation.providerNoMatch = true;
+    }
+    return null;
+  }
+  if (inspection.kind === "renewable") {
+    if (reservation?.inspectionOnlyTombstone) {
+      reservation.inspectionBlocked = true;
+      return null;
+    }
+    return {
+      subscriptionId: inspection.candidate.id,
+      ...inspection.recovered,
+      observedAtMs: Date.now(),
+    };
+  }
+  const error = inspection.error;
+  if (inspection.stage === "list" && error?.code === "SUBSCRIPTION_RECOVERY_AMBIGUOUS") {
+    recoveryError(
+      error.code,
+      "找到多筆符合的有效訂閱，為避免誤綁定，請聯絡支援處理。",
+    );
+  }
+  if (inspection.stage === "list") {
     logger.error("Portaly email recovery subscription list failed", {
       code: error?.code || null,
       portalyStatus: error?.portalyStatus || null,
       portalyCode: error?.portalyCode || null,
     });
     recoveryError(
-      "RECOVERY_LIST_FAILED",
-      "目前無法確認既有訂閱，請稍後重新同步。",
-      502,
+      "SUBSCRIPTION_RECOVERY_SAFETY_HOLD",
+      "目前無法確認既有訂閱，為避免重複付款，請稍後再試。",
+      409,
     );
   }
-
-  let candidate;
-  try {
-    candidate = selectRecoverableSubscription(customerSubscriptions, {
-      email: user.email,
-      planId: PORTALY_PLAN_ID,
-      mode,
-    });
-  } catch (error) {
-    if (error?.code === "SUBSCRIPTION_RECOVERY_AMBIGUOUS") {
-      recoveryError(
-        error.code,
-        "找到多筆符合的有效訂閱，為避免誤綁定，請聯絡支援處理。",
-      );
-    }
-    logger.error("Portaly email recovery subscription list is invalid", {
-      code: error?.code || null,
-    });
+  if (reservation?.inspectionOnlyTombstone) {
+    // An active or uncertain provider result must leave the deletion
+    // tombstone in place; its lease release restores the prior lock.
+    reservation.inspectionBlocked = true;
+    return null;
+  }
+  if (inspection.stage === "state_changed") {
     recoveryError(
-      "RECOVERY_LIST_INVALID",
-      "目前無法安全確認既有訂閱，請稍後重新同步。",
-      502,
+      "RECOVERY_STATE_CHANGED",
+      "訂閱狀態剛剛變更，請重新同步後再試。",
     );
   }
-  if (!candidate) return null;
-
-  const subscriptionId = candidate.id;
-  let portalyResult;
-  try {
-    portalyResult = await portalyRequest(
-      `/api/creator-subscription/subscriptions/${encodeURIComponent(subscriptionId)}`,
-      {apiKey},
-    );
-  } catch (error) {
-    logger.error("Portaly email recovery subscription lookup threw", {
-      message: error?.message || "Unknown error",
-      subscriptionId,
-    });
-    recoveryError(
-      "RECOVERY_PROVIDER_FAILED",
-      "目前無法確認既有訂閱，請稍後重新同步。",
-      502,
-    );
-  }
-  if (!portalyResult.response.ok) {
-    logger.error("Portaly email recovery subscription lookup failed", {
-      status: portalyResult.response.status,
-      code: portalyResult.payload?.code || null,
-      subscriptionId,
-    });
-    recoveryError(
-      "RECOVERY_PROVIDER_FAILED",
-      "目前無法確認既有訂閱，請稍後重新同步。",
-      502,
-    );
-  }
-
-  let recovered;
-  try {
-    recovered = recoveredSubscriptionState({
-      remote: portalyResult.payload,
-      subscriptionId,
-      email: user.email,
-      planId: PORTALY_PLAN_ID,
-      mode,
-    });
-  } catch (error) {
+  if (inspection.stage === "detail_invalid") {
     logger.error("Portaly email recovery subscription response is invalid", {
       code: error?.code || null,
-      subscriptionId,
     });
     recoveryError(
       "RECOVERY_DETAIL_INVALID",
@@ -1763,34 +1913,57 @@ async function queryRecoverableSubscription({apiKey, user, mode}) {
       502,
     );
   }
-  if (!recovered.recoverable) {
-    recoveryError(
-      "RECOVERY_STATE_CHANGED",
-      "訂閱狀態剛剛變更，請重新同步後再試。",
-    );
-  }
-  return {
-    subscriptionId,
-    ...recovered,
-    observedAtMs: Date.now(),
-  };
+  logger.error("Portaly email recovery subscription lookup failed", {
+    code: error?.code || null,
+    portalyStatus: error?.portalyStatus || null,
+    portalyCode: error?.portalyCode || null,
+  });
+  recoveryError(
+    "RECOVERY_PROVIDER_FAILED",
+    "目前無法確認既有訂閱，請稍後重新同步。",
+    502,
+  );
 }
 
 async function finalizeSubscriptionRecovery({user, mode, recoveryId, lockRef, recovered}) {
   const userRef = db.collection("users").doc(user.uid);
   const sessionRef = db.collection("checkoutSessions").doc(recovered.subscriptionId);
   const grantRef = entitlementGrantRef(user.uid);
+  // These single-field queries are the bounded ownership guard for a missing
+  // checkout session. They are read inside the same transaction as the new
+  // binding, so a concurrent live user cannot win between the check and the
+  // recovery write. No email/full-collection scan is performed.
+  const ownerBySubscriptionQuery = db.collection("users")
+    .where("subscriptionId", "==", recovered.subscriptionId)
+    .limit(101);
+  const ownerByCheckoutQuery = db.collection("users")
+    .where("currentCheckoutSessionId", "==", recovered.subscriptionId)
+    .limit(101);
+  const refundMarkersQuery = db.collection("portalyCompensations")
+    .where("subscriptionId", "==", recovered.subscriptionId)
+    .limit(101);
   const auditRef = db.collection("portalyAudit").doc(recoveryAuditId({
     uid: user.uid,
     subscriptionId: recovered.subscriptionId,
     mode,
   }));
   const result = await db.runTransaction(async (transaction) => {
-    const [lockSnapshot, userSnapshot, sessionSnapshot, grantSnapshot] = await Promise.all([
+    const [
+      lockSnapshot,
+      userSnapshot,
+      sessionSnapshot,
+      grantSnapshot,
+      ownerBySubscriptionSnapshot,
+      ownerByCheckoutSnapshot,
+      refundMarkersSnapshot,
+    ] = await Promise.all([
       transaction.get(lockRef),
       transaction.get(userRef),
       transaction.get(sessionRef),
       transaction.get(grantRef),
+      transaction.get(ownerBySubscriptionQuery),
+      transaction.get(ownerByCheckoutQuery),
+      transaction.get(refundMarkersQuery),
     ]);
     const lock = lockSnapshot.data() || null;
     const leaseExpiresAtMs = Number(lock?.leaseExpiresAtMs);
@@ -1799,6 +1972,31 @@ async function finalizeSubscriptionRecovery({user, mode, recoveryId, lockRef, re
         leaseExpiresAtMs <= Date.now()) {
       recoveryError("EMAIL_RECOVERY_RACE", "會員恢復狀態已變更，請重新同步後再試。");
     }
+    const reclaimFromAccountUidHash = nonBlankString(lock.reclaimFromAccountUidHash);
+    const accountUidHash = nonBlankString(lock.accountUidHash);
+    const allowsDeletedOwnership = Boolean(
+      reclaimFromAccountUidHash && accountUidHash &&
+      reclaimFromAccountUidHash === accountUidHash,
+    );
+    if (reclaimFromAccountUidHash && !allowsDeletedOwnership) {
+      recoveryError("RECOVERY_LOCAL_IDENTITY_CONFLICT", "帳號刪除資料無法安全驗證，暫時無法恢復會員。");
+    }
+    if (ownerBySubscriptionSnapshot.size >= 101 || ownerByCheckoutSnapshot.size >= 101 ||
+        refundMarkersSnapshot.size >= 101) {
+      recoveryError("RECOVERY_OWNER_STATE_CONFLICT", "會員綁定資料過多，暫時無法安全恢復會員。");
+    }
+    const ownerEntries = [
+      ...ownerBySubscriptionSnapshot.docs.map((doc) => subscriptionOwnerQueryEntry({
+        id: doc.id,
+        data: doc.data(),
+        matchedField: "subscriptionId",
+      })),
+      ...ownerByCheckoutSnapshot.docs.map((doc) => subscriptionOwnerQueryEntry({
+        id: doc.id,
+        data: doc.data(),
+        matchedField: "currentCheckoutSessionId",
+      })),
+    ];
     const current = userSnapshot.data() || {};
     if (!currentUserEmailMatches(current, user.email) || !currentUserUidMatches(current, user.uid)) {
       recoveryError("RECOVERY_LOCAL_IDENTITY_CONFLICT", "目前帳號資料與已驗證 Email 不一致。");
@@ -1830,9 +2028,54 @@ async function finalizeSubscriptionRecovery({user, mode, recoveryId, lockRef, re
         mode,
         subscriptionId: recovered.subscriptionId,
         observedAtMs: recovered.observedAtMs,
+        allowDeletedOwnership: allowsDeletedOwnership,
       });
     }
 
+    const refundMarkerDocuments = refundMarkersSnapshot.docs
+      .filter((doc) => doc.data()?.kind === REFUND_RECONCILIATION_KIND);
+    const compensationDocuments = refundMarkersSnapshot.docs
+      .filter((doc) => doc.data()?.kind !== REFUND_RECONCILIATION_KIND);
+    const ownershipPlan = subscriptionRecoveryOwnershipTransaction({
+      ownerEntries,
+      refundMarkerEntries: refundMarkerDocuments.map((doc) => ({
+        id: doc.id,
+        ref: doc.ref,
+        data: doc.data(),
+      })),
+      compensationEntries: compensationDocuments.map((doc) => ({
+        id: doc.id,
+        ref: doc.ref,
+        data: doc.data(),
+      })),
+      uid: user.uid,
+      email: user.email,
+      planId: PORTALY_PLAN_ID,
+      mode,
+      subscriptionId: recovered.subscriptionId,
+      deletedAccountUidHash: reclaimFromAccountUidHash,
+      allowDeletedOwnership: allowsDeletedOwnership,
+      writeRefundMarker: (entry) => {
+        transaction.set(entry.ref, {
+          uid: user.uid,
+          customerEmail: user.email,
+          accountDeleted: FieldValue.delete(),
+          status: "pending",
+          leaseId: FieldValue.delete(),
+          leaseExpiresAtMs: FieldValue.delete(),
+          updatedAt: FieldValue.serverTimestamp(),
+        }, {merge: true});
+      },
+    });
+    if (ownershipPlan.kind === "conflict") {
+      const markerConflict = ownershipPlan.code?.startsWith("RECOVERY_REFUND_MARKER_");
+      recoveryError(
+        ownershipPlan.code,
+        markerConflict ?
+          "退款同步資料與目前帳號不一致，暫時無法恢復會員。" :
+          "目前帳號已有不同的訂閱綁定，為避免覆蓋會員資料，暫時無法恢復。",
+      );
+    }
     const timestamp = FieldValue.serverTimestamp();
     const providerPatch = recoveryProviderPatch(recovered.state, {
       planId: PORTALY_PLAN_ID,
@@ -1930,7 +2173,12 @@ async function recoverSubscriptionByEmail(request, response) {
         mode,
         recoveryId,
       }),
-      discover: () => queryRecoverableSubscription({apiKey, user, mode}),
+      discover: ({reservation}) => queryRecoverableSubscription({
+        apiKey,
+        user,
+        mode,
+        reservation,
+      }),
       finalize: ({reservation, recovered}) => finalizeSubscriptionRecovery({
         user,
         mode,
@@ -1938,9 +2186,23 @@ async function recoverSubscriptionByEmail(request, response) {
         lockRef: reservation.lockRef,
         recovered,
       }),
-      release: (reservation) => releaseSubscriptionRecovery(reservation.lockRef, recoveryId),
+      release: (reservation) => releaseSubscriptionRecovery(
+        reservation.lockRef,
+        recoveryId,
+        {
+          restoreTombstone: (reservation.reclaimFromAccountUidHash ||
+            reservation.inspectionOnlyTombstone) && !reservation.providerNoMatch ?
+            reservation.previousLock : null,
+        },
+      ),
     });
     if (workflow.status === "not_found") {
+      if (workflow.reservation?.inspectionBlocked) {
+        recoveryError(
+          "ACCOUNT_DELETION_SAFETY_HOLD",
+          "帳號刪除安全保護尚未完成，請稍後再試。",
+        );
+      }
       const snapshot = await db.collection("users").doc(user.uid).get();
       const grant = await userEntitlementGrant(user.uid);
       return json(response, 200, recoveryResponseEnvelope(
@@ -2288,6 +2550,7 @@ async function deleteAccount(request, response) {
   }
 
   let canceledSubscriptionIds = [];
+  let providerHasRenewableSubscription = false;
 
   if (user.emailVerified) {
     reportSkillVersion(apiKey);
@@ -2301,6 +2564,15 @@ async function deleteAccount(request, response) {
         planId: PORTALY_PLAN_ID,
         mode,
       });
+      // The selector above validates every in-scope record. An already
+      // cancel-at-period-end subscription still has a provider propagation
+      // window, so retain the deletion tombstone for that case too.
+      const expectedEmail = normalizeCustomerEmail(user.email);
+      providerHasRenewableSubscription = customerSubscriptions.some((subscription) =>
+        normalizeCustomerEmail(subscription.customerEmail) === expectedEmail &&
+        subscription.planId === PORTALY_PLAN_ID &&
+        subscription.mode === mode &&
+        ["active", "past_due", "cancel_requested"].includes(subscription.status));
 
       for (const subscriptionId of canceledSubscriptionIds) {
         const {response: cancelResponse, payload: cancelPayload} = await portalyRequest(
@@ -2430,18 +2702,25 @@ async function deleteAccount(request, response) {
       refs.findIndex((candidate) => candidate.path === ref.path) === index,
     );
     for (const lockRef of lockRefsToDelete) transaction.delete(lockRef);
-    const tombstoneWrite = accountDeletionTombstoneWrite({
-      accountUidHash,
-      uid: FieldValue.delete(),
-      deletionId: FieldValue.delete(),
-      planId: PORTALY_PLAN_ID,
-      mode,
-      status: "account_deleted",
-      safetyHoldUntilMs: Date.now() + CHECKOUT_UNCERTAIN_HOLD_MS,
-      accountDeletedAt: FieldValue.serverTimestamp(),
-      updatedAt: FieldValue.serverTimestamp(),
+    const canSkipCustomerTombstone = accountDeletionCanSkipCustomerTombstone({
+      providerHasRenewableSubscription,
     });
-    transaction.set(customerLockRef, tombstoneWrite.data, tombstoneWrite.options);
+    if (canSkipCustomerTombstone) {
+      transaction.delete(customerLockRef);
+    } else {
+      const tombstoneWrite = accountDeletionTombstoneWrite({
+        accountUidHash,
+        uid: FieldValue.delete(),
+        deletionId: FieldValue.delete(),
+        planId: PORTALY_PLAN_ID,
+        mode,
+        status: "account_deleted",
+        safetyHoldUntilMs: Date.now() + CHECKOUT_UNCERTAIN_HOLD_MS,
+        accountDeletedAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      transaction.set(customerLockRef, tombstoneWrite.data, tombstoneWrite.options);
+    }
     return {kind: "deleted"};
   });
 
@@ -2471,14 +2750,52 @@ async function deleteAccount(request, response) {
 
 async function compensateDeletedAccountSubscription(compensation) {
   const compensationRef = db.collection("portalyCompensations").doc(compensation.id);
+  const subscriptionId = nonBlankString(compensation.subscriptionId);
+  const validSubscriptionId = subscriptionId && subscriptionId !== "." &&
+    subscriptionId !== ".." && !subscriptionId.includes("/") &&
+    Buffer.byteLength(subscriptionId, "utf8") <= 1500;
+  if (!validSubscriptionId) {
+    throw Object.assign(new Error("Deleted-account cancellation subscription id is invalid"), {
+      statusCode: 503,
+      code: "DELETED_ACCOUNT_CANCELLATION_STATE_UNCERTAIN",
+    });
+  }
+  const sessionRef = db.collection("checkoutSessions").doc(subscriptionId);
   const leaseId = randomUUID();
   const claim = await db.runTransaction(async (transaction) => {
-    const snapshot = await transaction.get(compensationRef);
+    const [snapshot, sessionSnapshot] = await Promise.all([
+      transaction.get(compensationRef),
+      transaction.get(sessionRef),
+    ]);
     if (!snapshot.exists || snapshot.data()?.status === "completed") {
       return {kind: "complete"};
     }
     const current = snapshot.data() || {};
     const leaseExpiresAtMs = Number(current.leaseExpiresAtMs);
+    const ownership = deletedAccountCompensationOwnershipDecision({
+      marker: current,
+      session: sessionSnapshot.exists ? sessionSnapshot.data() : null,
+    });
+    if (ownership.kind === "reclaimed") {
+      if (current.status === "processing" && Number.isFinite(leaseExpiresAtMs) &&
+          leaseExpiresAtMs > Date.now()) {
+        return {kind: "in_progress"};
+      }
+      transaction.set(compensationRef, {
+        status: "completed",
+        leaseId: FieldValue.delete(),
+        leaseExpiresAtMs: FieldValue.delete(),
+        requiresStatusCheck: FieldValue.delete(),
+        completedAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      }, {merge: true});
+      return {kind: "complete"};
+    }
+    if (ownership.kind !== "deleted_owner") {
+      throw Object.assign(new Error("Deleted-account cancellation ownership is uncertain"), {
+        code: ownership.code || "DELETED_ACCOUNT_CANCELLATION_STATE_UNCERTAIN",
+      });
+    }
     if (current.status === "processing" && Number.isFinite(leaseExpiresAtMs) &&
         leaseExpiresAtMs > Date.now()) {
       return {kind: "in_progress"};
@@ -2621,6 +2938,45 @@ async function compensateDeletedAccountSubscription(compensation) {
   }
 }
 
+async function completeRefundReconciliationMarker({
+  markerRef,
+  sessionRef,
+  leaseId,
+  sourceTimestampMs,
+} = {}) {
+  await db.runTransaction(async (transaction) => {
+    const [markerSnapshot, sessionSnapshot] = await Promise.all([
+      transaction.get(markerRef),
+      transaction.get(sessionRef),
+    ]);
+    const latestMarker = markerSnapshot.data() || {};
+    if (!markerSnapshot.exists || !refundReconciliationLeaseMatches({
+      marker: latestMarker,
+      leaseId,
+      sourceTimestampMs,
+    })) {
+      return;
+    }
+    if (!sessionSnapshot.exists) {
+      throw Object.assign(new Error("Refund reconciliation checkout session is missing"), {
+        code: "REFUND_RECONCILIATION_SESSION_MISSING",
+      });
+    }
+    transaction.set(markerRef, {
+      status: "completed",
+      leaseId: FieldValue.delete(),
+      leaseExpiresAtMs: FieldValue.delete(),
+      completedAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    }, {merge: true});
+    transaction.set(sessionSnapshot.ref, {
+      refundReconciliation: FieldValue.delete(),
+      refundReconciliationRequired: FieldValue.delete(),
+      updatedAt: FieldValue.serverTimestamp(),
+    }, {merge: true});
+  });
+}
+
 async function reconcileRefundSubscriptionMarker(marker) {
   const markerRef = db.collection("portalyCompensations").doc(marker.id);
   const leaseId = randomUUID();
@@ -2666,16 +3022,89 @@ async function reconcileRefundSubscriptionMarker(marker) {
     const markerMode = nonBlankString(current.mode);
     const sourceEvent = nonBlankString(current.sourceEvent);
     const sourceTimestampMs = Number(current.sourceTimestampMs);
-    if (!uid || !email || !sessionId || !subscriptionId || sessionId !== subscriptionId ||
-        planId !== PORTALY_PLAN_ID || markerMode !== mode ||
+    const validSessionId = sessionId && sessionId !== "." && sessionId !== ".." &&
+      !sessionId.includes("/") && Buffer.byteLength(sessionId, "utf8") <= 1500;
+    if (!email || !sessionId || !validSessionId || !subscriptionId ||
+        sessionId !== subscriptionId || planId !== PORTALY_PLAN_ID || markerMode !== mode ||
         !REFUND_CALLBACK_EVENTS.has(sourceEvent) || !Number.isFinite(sourceTimestampMs)) {
       throw Object.assign(new Error("Refund reconciliation marker identity is invalid"), {
         code: "REFUND_RECONCILIATION_MARKER_INVALID",
       });
     }
 
-    const userRef = db.collection("users").doc(uid);
-    const userSnapshot = await userRef.get();
+    const sessionRef = db.collection("checkoutSessions").doc(sessionId);
+    const sessionSnapshot = await sessionRef.get();
+    const session = sessionSnapshot.data() || {};
+    const accountDeleted = sessionSnapshot.exists && session.accountDeleted === true;
+    // A marker created before account deletion still carries the old UID. A
+    // deleted-session tombstone is the only local proof that the UID may no
+    // longer resolve to a user; without it, missing-user markers stay retryable
+    // rather than being silently discarded.
+    if (!uid && !accountDeleted) {
+      throw Object.assign(new Error("Refund reconciliation marker has no owner"), {
+        code: "REFUND_RECONCILIATION_MARKER_INVALID",
+      });
+    }
+    const userRef = uid ? db.collection("users").doc(uid) : null;
+    const userSnapshot = userRef ? await userRef.get() : null;
+    if (accountDeleted) {
+      reportSkillVersion(apiKey);
+      let portalyResult;
+      try {
+        portalyResult = await portalyRequest(
+          `/api/creator-subscription/subscriptions/${encodeURIComponent(subscriptionId)}`,
+          {apiKey},
+        );
+      } catch (error) {
+        throw Object.assign(new Error("Refund reconciliation provider status is uncertain"), {
+          code: "REFUND_RECONCILIATION_PROVIDER_FAILED",
+          portalyStatus: error?.portalyStatus || null,
+          portalyCode: error?.portalyCode || null,
+        });
+      }
+      if (!portalyResult.response.ok) {
+        throw Object.assign(new Error("Refund reconciliation provider status failed"), {
+          code: "REFUND_RECONCILIATION_PROVIDER_FAILED",
+          portalyStatus: portalyResult.response.status,
+          portalyCode: portalyResult.payload?.code || null,
+        });
+      }
+      let recovered;
+      try {
+        recovered = recoveredSubscriptionState({
+          remote: portalyResult.payload,
+          subscriptionId,
+          email,
+          planId: PORTALY_PLAN_ID,
+          mode,
+        });
+      } catch (error) {
+        throw Object.assign(new Error("Refund reconciliation provider response is invalid"), {
+          code: "REFUND_RECONCILIATION_PROVIDER_INVALID",
+          reconciliationCode: error?.code || null,
+        });
+      }
+      if (deletedAccountRefundOutcome({
+        subscriptionId,
+        expectedSubscriptionId: subscriptionId,
+        planId: PORTALY_PLAN_ID,
+        expectedPlanId: PORTALY_PLAN_ID,
+        mode,
+        expectedMode: mode,
+        subscriptionStatus: recovered.value.status,
+      }) !== "complete") {
+        throw Object.assign(new Error("Refund reconciliation user is missing"), {
+          code: "REFUND_RECONCILIATION_PROVIDER_RETRYABLE",
+        });
+      }
+      await completeRefundReconciliationMarker({
+        markerRef,
+        sessionRef,
+        leaseId,
+        sourceTimestampMs,
+      });
+      return;
+    }
     if (!userSnapshot.exists) {
       throw Object.assign(new Error("Refund reconciliation user is missing"), {
         code: "REFUND_RECONCILIATION_USER_MISSING",
@@ -2689,7 +3118,7 @@ async function reconcileRefundSubscriptionMarker(marker) {
     }
 
     reportSkillVersion(apiKey);
-    await reconcilePortalySubscriptionForUser({
+    const reconciled = await reconcilePortalySubscriptionForUser({
       user: {
         uid,
         email: currentUser.email,
@@ -2700,37 +3129,25 @@ async function reconcileRefundSubscriptionMarker(marker) {
       expectedMode: mode,
       trustedLookupId: subscriptionId,
     });
+    if (deletedAccountRefundOutcome({
+      subscriptionId,
+      expectedSubscriptionId: subscriptionId,
+      planId: PORTALY_PLAN_ID,
+      expectedPlanId: PORTALY_PLAN_ID,
+      mode,
+      expectedMode: mode,
+      subscriptionStatus: reconciled?.subscriptionStatus,
+    }) !== "complete") {
+      throw Object.assign(new Error("Refund reconciliation provider status remains renewable"), {
+        code: "REFUND_RECONCILIATION_PROVIDER_RETRYABLE",
+      });
+    }
 
-    await db.runTransaction(async (transaction) => {
-      const [markerSnapshot, sessionSnapshot] = await Promise.all([
-        transaction.get(markerRef),
-        transaction.get(db.collection("checkoutSessions").doc(current.sessionId)),
-      ]);
-      const latestMarker = markerSnapshot.data() || {};
-      if (!markerSnapshot.exists || !refundReconciliationLeaseMatches({
-        marker: latestMarker,
-        leaseId,
-        sourceTimestampMs,
-      })) {
-        return;
-      }
-      if (!sessionSnapshot.exists) {
-        throw Object.assign(new Error("Refund reconciliation checkout session is missing"), {
-          code: "REFUND_RECONCILIATION_SESSION_MISSING",
-        });
-      }
-      transaction.set(markerRef, {
-        status: "completed",
-        leaseId: FieldValue.delete(),
-        leaseExpiresAtMs: FieldValue.delete(),
-        completedAt: FieldValue.serverTimestamp(),
-        updatedAt: FieldValue.serverTimestamp(),
-      }, {merge: true});
-      transaction.set(sessionSnapshot.ref, {
-        refundReconciliation: FieldValue.delete(),
-        refundReconciliationRequired: FieldValue.delete(),
-        updatedAt: FieldValue.serverTimestamp(),
-      }, {merge: true});
+    await completeRefundReconciliationMarker({
+      markerRef,
+      sessionRef,
+      leaseId,
+      sourceTimestampMs,
     });
   } catch (error) {
     await db.runTransaction(async (transaction) => {
@@ -2857,8 +3274,11 @@ async function processCallback(request, response) {
       db.collection("users").doc(session.uid);
     const grantRef = userRef ? entitlementGrantRef(session.uid) : null;
     const [lockSnapshots, userSnapshot, grantSnapshot] = await Promise.all([
-      Promise.all(lockRefs.map((ref) => orphanCustomerLockRef &&
-        ref.path === orphanCustomerLockRef.path ? orphanLockSnapshot : transaction.get(ref))),
+      Promise.all(lockRefs.map((ref) => canReuseOrphanLockSnapshot({
+        orphanLockPath: orphanCustomerLockRef?.path,
+        refPath: ref.path,
+        snapshotFetched: orphanLockSnapshot !== null,
+      }) ? orphanLockSnapshot : transaction.get(ref))),
       userRef ? transaction.get(userRef) : Promise.resolve(null),
       grantRef ? transaction.get(grantRef) : Promise.resolve(null),
     ]);
@@ -2968,6 +3388,7 @@ async function processCallback(request, response) {
           status: "pending",
           leaseId: FieldValue.delete(),
           leaseExpiresAtMs: FieldValue.delete(),
+          accountDeleted: session.accountDeleted === true,
           ...(markerIsCompleted ? {completedAt: FieldValue.delete()} : {}),
           updatedAt: FieldValue.serverTimestamp(),
         }, {merge: true});
@@ -3163,8 +3584,19 @@ export const retryPortalyCompensation = onDocumentWritten(
     if (value?.status !== "pending") return;
     const compensationId = nonBlankString(event.params?.compensationId);
     if (value?.kind === REFUND_RECONCILIATION_KIND) {
-      if (!compensationId || !nonBlankString(value.uid) ||
-          !nonBlankString(value.sessionId) || !nonBlankString(value.subscriptionId) ||
+      const markerSessionId = nonBlankString(value.sessionId);
+      const markerSessionIdIsSafe = markerSessionId && markerSessionId !== "." &&
+        markerSessionId !== ".." && !markerSessionId.includes("/") &&
+        Buffer.byteLength(markerSessionId, "utf8") <= 1500;
+      let ownerlessDeletedSession = false;
+      if (!nonBlankString(value.uid) && markerSessionIdIsSafe) {
+        const markerSessionSnapshot = await db.collection("checkoutSessions")
+          .doc(markerSessionId).get();
+        ownerlessDeletedSession = markerSessionSnapshot.exists &&
+          markerSessionSnapshot.data()?.accountDeleted === true;
+      }
+      if (!compensationId || (!nonBlankString(value.uid) && !ownerlessDeletedSession) ||
+          !markerSessionIdIsSafe || !nonBlankString(value.subscriptionId) ||
           !nonBlankString(value.planId) || !nonBlankString(value.mode) ||
           !nonBlankString(value.orderId)) {
         logger.error("Refund reconciliation marker is invalid", {compensationId});

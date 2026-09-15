@@ -1,10 +1,12 @@
 import SwiftUI
 import MapKit
 import CoreLocation
+import UIKit
 
 struct LocationSimulationUIView: View {
     @Environment(\.adaptiveLayout) private var layout
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.openURL) private var openURL
     @EnvironmentObject private var sharedMapState: SharedLocationMapState
     @AppStorage(UserDefaults.Keys.lastJoystickSpeed) private var lastJoystickSpeed: Double = 10
     @AppStorage(UserDefaults.Keys.hasShownInitialPairingPrompt) private var hasShownInitialPairingPrompt = false
@@ -118,6 +120,11 @@ struct LocationSimulationUIView: View {
             }
         }
         .alert("提示", isPresented: $uiState.showAlert) {
+            if uiState.alertMessage == RuntimeEnvironment.current.deniedLocationPermissionMessage {
+                Button("開啟定位設定") {
+                    openLocationSettings()
+                }
+            }
             Button("確定", role: .cancel) { }
         } message: {
             Text(uiState.alertMessage)
@@ -235,7 +242,7 @@ struct LocationSimulationUIView: View {
                 currentLocationProvider.requestCurrentLocation(allowCachedLocation: false)
             case .denied, .restricted:
                 uiState.recenterAfterPairingAuthorization = false
-                uiState.alertMessage = "定位授權被拒絕。請到「設定」>「隱私」>「定位服務」中允許此應用進行定位。"
+                uiState.alertMessage = RuntimeEnvironment.current.deniedLocationPermissionMessage
                 uiState.showAlert = true
             default:
                 break
@@ -1136,6 +1143,11 @@ struct LocationSimulationUIView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
             uiState.showCompatibilityCheck = true
         }
+    }
+
+    private func openLocationSettings() {
+        guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+        openURL(url)
     }
     
     

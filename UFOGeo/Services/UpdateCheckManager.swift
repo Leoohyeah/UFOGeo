@@ -2,6 +2,11 @@ import Combine
 import Foundation
 import UIKit
 
+enum UpdateInstallTarget {
+    case liveContainer
+    case downloadIPA
+}
+
 final class UpdateCheckManager: ObservableObject {
     @Published var hasUpdate = false
     @Published var latestVersion: AppVersion?
@@ -16,6 +21,9 @@ final class UpdateCheckManager: ObservableObject {
     private let repositoryName = "UFOGeo"
     private let checkInterval: TimeInterval = 86400 // 24小時檢查一次
     private var cancellables = Set<AnyCancellable>()
+
+    static let latestIPADownloadURLString =
+        "https://github.com/Leoohyeah/UFOGeo/releases/latest/download/UFOGeo.ipa"
 
     init() {
         lastCheckDate = UserDefaults.standard.object(forKey: UserDefaults.Keys.lastUpdateCheckDate) as? Date
@@ -94,11 +102,40 @@ final class UpdateCheckManager: ObservableObject {
         return "0.0.1"
     }
 
-    /// 打開更新頁面
-    func openUpdatePage() {
-        guard let url = URL(string: "sidestore://install?url=https://github.com/Leoohyeah/UFOGeo/releases/latest/download/UFOGeo.ipa") else {
+    /// 開啟更新方式。LiveContainer 安裝透過網站上的按鈕交給 LiveContainer。
+    static func updateURL(for target: UpdateInstallTarget) -> URL? {
+        switch target {
+        case .liveContainer:
+            return URL(string: "https://leoohyeah.github.io/UFOGeo/")
+        case .downloadIPA:
+            return URL(string: latestIPADownloadURLString)
+        }
+    }
+
+    func openUpdate(
+        target: UpdateInstallTarget,
+        completion: @escaping (Bool) -> Void
+    ) {
+        guard let url = Self.updateURL(for: target) else {
+            DispatchQueue.main.async {
+                completion(false)
+            }
             return
         }
-        UIApplication.shared.open(url)
+
+        // UIApplication.open 的 completion handler 不保證在主執行緒呼叫，
+        // 讓畫面安全更新錯誤提示與按鈕狀態。
+        DispatchQueue.main.async {
+            UIApplication.shared.open(url, options: [:]) { success in
+                DispatchQueue.main.async {
+                    completion(success)
+                }
+            }
+        }
+    }
+
+    /// 保留舊呼叫介面，預設開啟更新安裝網頁。
+    func openUpdatePage(completion: @escaping (Bool) -> Void = { _ in }) {
+        openUpdate(target: .liveContainer, completion: completion)
     }
 }

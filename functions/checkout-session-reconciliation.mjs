@@ -2,6 +2,7 @@ const PORTALY_MODES = new Set(["live", "test"]);
 const CHECKOUT_PENDING_STATUSES = new Set(["pending", "created", "checkout_ready"]);
 const CHECKOUT_TERMINAL_STATUSES = new Set(["failed", "canceled", "cancelled", "expired"]);
 const CHECKOUT_SUCCESS_STATUSES = new Set(["completed"]);
+const LOCAL_RESOLVED_STATUSES = new Set(["active", "completed"]);
 const LOCAL_HOLD_STATUSES = new Set([
   "pending",
   "created",
@@ -114,7 +115,7 @@ export function checkoutSessionReconciliationTarget({
   return {sessionId, uid: expectedUid, email: expectedEmail, planId: expectedPlanId, mode};
 }
 
-export function validateStoredCheckoutSession(session, target) {
+export function validateStoredCheckoutSession(session, target, {allowResolved = false} = {}) {
   if (!isRecord(session) || !target) {
     fail("CHECKOUT_RECONCILIATION_SESSION_MISSING", "Checkout session is missing");
   }
@@ -147,7 +148,8 @@ export function validateStoredCheckoutSession(session, target) {
   if (normalizedEmail(session.customerEmail) !== target.email) {
     fail("CHECKOUT_RECONCILIATION_EMAIL_MISMATCH", "Session email does not match");
   }
-  if (!LOCAL_HOLD_STATUSES.has(session.status)) {
+  if (!LOCAL_HOLD_STATUSES.has(session.status) &&
+      !(allowResolved && LOCAL_RESOLVED_STATUSES.has(session.status))) {
     fail("CHECKOUT_RECONCILIATION_SESSION_STATE_CHANGED", "Checkout session is no longer pending");
   }
   return session;
@@ -161,7 +163,10 @@ function unwrapCheckoutSession(payload) {
 }
 
 export function verifiedCheckoutSessionState(payload, {target, localSession} = {}) {
-  validateStoredCheckoutSession(localSession, target);
+  const hasLocalSession = localSession !== null && localSession !== undefined;
+  if (hasLocalSession) {
+    validateStoredCheckoutSession(localSession, target);
+  }
   const remote = unwrapCheckoutSession(payload);
   const remoteId = documentId(remote.sessionId ?? remote.id);
   if (!remoteId || remoteId !== target.sessionId) {
@@ -181,7 +186,9 @@ export function verifiedCheckoutSessionState(payload, {target, localSession} = {
   if (remote.mode !== undefined && remote.mode !== target.mode) {
     fail("PORTALY_CHECKOUT_MODE_MISMATCH", "Portaly checkout mode does not match");
   }
-  const expectedOrderNumber = nonBlankString(localSession.merchantOrderNumber);
+  const expectedOrderNumber = hasLocalSession ?
+    nonBlankString(localSession.merchantOrderNumber) :
+    null;
   if (expectedOrderNumber && nonBlankString(remote.merchantOrderNumber) !== expectedOrderNumber) {
     fail("PORTALY_CHECKOUT_ORDER_MISMATCH", "Portaly checkout order does not match");
   }
@@ -245,14 +252,34 @@ export async function reconcileCheckoutSessionPath({
     fail("CHECKOUT_RECONCILIATION_ADAPTER_INVALID", "Checkout reconciliation adapter is invalid");
   }
 
-  const localSession = validateStoredCheckoutSession(
-    await loadSession(target.sessionId),
-    target,
-  );
+  const loadedSession = await loadSession(target.sessionId);
+  const localSession = loadedSession ?
+    validateStoredCheckoutSession(loadedSession, target, {allowResolved: true}) :
+    null;
+  if (localSession && LOCAL_RESOLVED_STATUSES.has(localSession.status) &&
+      localSession.accountDeleted !== true) {
+    // A signed Portaly callback may have finalized the local session while
+    // this request still carries the pre-callback user/lock snapshot. The
+    // checkout resource is already resolved; reconcile the authoritative
+    // subscription instead of querying a now-invalid pending session.
+    return reconcileCompleted({
+      target,
+      localSession,
+      remote: null,
+      trustedLookupId: target.sessionId,
+      localSessionResolved: true,
+    });
+  }
+  if (localSession && LOCAL_RESOLVED_STATUSES.has(localSession.status)) {
+    fail("CHECKOUT_RECONCILIATION_SESSION_STATE_CHANGED", "Checkout session is no longer pending");
+  }
   const state = verifiedCheckoutSessionState(
     await queryCheckoutSession(target.sessionId),
     {target, localSession},
   );
+  if (!localSession && state.kind === "pending") {
+    fail("CHECKOUT_RECONCILIATION_SESSION_MISSING", "Checkout session is missing");
+  }
   if (state.kind === "pending") {
     return {kind: "pending", target, localSession, providerStatus: state.status};
   }

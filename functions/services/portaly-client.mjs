@@ -2,7 +2,7 @@ import * as logger from "firebase-functions/logger";
 
 const DEFAULT_API_HOST = (process.env.PORTALY_API_HOST || "https://portaly.ai").replace(/\/$/, "");
 
-export const PORTALY_SKILL_VERSION = "0.11.3";
+export const PORTALY_SKILL_VERSION = "0.12.0";
 
 export async function portalyRequest(path, {apiKey, method = "GET", body, timeoutMs = 15_000, host = DEFAULT_API_HOST} = {}) {
   const response = await fetch(`${host}${path}`, {

@@ -42,6 +42,31 @@ struct ImportTypeIsolationTests {
         }
     }
 
+    @Test func pairingValidationAcceptsImpactorRemotePairingOnlyFile() throws {
+        try PairingFileStore.validate(Self.validPairingData(includeLockdownFields: false))
+    }
+
+    @Test func pairingValidationAcceptsILoaderCombinedPairingFile() throws {
+        try PairingFileStore.validate(Self.validPairingData())
+    }
+
+    @Test func pairingValidationRejectsWrongRemotePairingKeyLengthOrEmptyIdentifier() throws {
+        let shortPublicKeyData = try Self.validPairingData(publicKeyLength: 31)
+        #expect(throws: PairingFileError.invalidField("public_key")) {
+            try PairingFileStore.validate(shortPublicKeyData)
+        }
+
+        let shortPrivateKeyData = try Self.validPairingData(privateKeyLength: 33)
+        #expect(throws: PairingFileError.invalidField("private_key")) {
+            try PairingFileStore.validate(shortPrivateKeyData)
+        }
+
+        let emptyIdentifierData = try Self.validPairingData(identifier: " \n ")
+        #expect(throws: PairingFileError.invalidField("identifier")) {
+            try PairingFileStore.validate(emptyIdentifierData)
+        }
+    }
+
     @Test func prepareURLDoesNotMoveOrDeleteLegacyPairingSource() throws {
         let fileManager = FileManager.default
         removeStoredPairingFile(fileManager: fileManager)
@@ -79,27 +104,44 @@ struct ImportTypeIsolationTests {
         #expect(storedData == sourceData)
     }
 
-    @Test func invalidPairingImportPreservesExistingValidFile() throws {
+    @Test func invalidPairingImportPreservesExistingValidFileIncludingLockdownOnly() throws {
         let fileManager = FileManager.default
         removeStoredPairingFile(fileManager: fileManager)
 
         let validURL = fileManager.temporaryDirectory
             .appendingPathComponent("valid-pairing-\(UUID().uuidString).plist")
-        let invalidURL = fileManager.temporaryDirectory
+        let invalidPropertyListURL = fileManager.temporaryDirectory
             .appendingPathComponent("invalid-pairing-\(UUID().uuidString).plist")
+        let lockdownOnlyURL = fileManager.temporaryDirectory
+            .appendingPathComponent("lockdown-only-pairing-\(UUID().uuidString).plist")
         let validData = try Self.validPairingData()
         try validData.write(to: validURL, options: .atomic)
-        try Data("not a pairing file".utf8).write(to: invalidURL, options: .atomic)
+        try Data("not a pairing file".utf8).write(
+            to: invalidPropertyListURL,
+            options: .atomic
+        )
+        try Self.lockdownOnlyPairingData().write(to: lockdownOnlyURL, options: .atomic)
         defer {
             try? fileManager.removeItem(at: validURL)
-            try? fileManager.removeItem(at: invalidURL)
+            try? fileManager.removeItem(at: invalidPropertyListURL)
+            try? fileManager.removeItem(at: lockdownOnlyURL)
             removeStoredPairingFile(fileManager: fileManager)
         }
 
         try PairingFileStore.importFromPicker(validURL, fileManager: fileManager)
 
         #expect(throws: PairingFileError.invalidPropertyList) {
-            try PairingFileStore.importFromPicker(invalidURL, fileManager: fileManager)
+            try PairingFileStore.importFromPicker(
+                invalidPropertyListURL,
+                fileManager: fileManager
+            )
+        }
+        #expect(throws: PairingFileError.missingRequiredFields([
+            "public_key",
+            "private_key",
+            "identifier"
+        ])) {
+            try PairingFileStore.importFromPicker(lockdownOnlyURL, fileManager: fileManager)
         }
         let storedData = try Data(contentsOf: PairingFileStore.url)
         #expect(storedData == validData)
@@ -130,8 +172,31 @@ struct ImportTypeIsolationTests {
         }
     }
 
-    private static func validPairingData() throws -> Data {
-        let propertyList: [String: Any] = [
+    private static func validPairingData(
+        includeLockdownFields: Bool = true,
+        publicKeyLength: Int = 32,
+        privateKeyLength: Int = 32,
+        identifier: String = "impactor-device-id"
+    ) throws -> Data {
+        var propertyList: [String: Any] = [
+            "public_key": Data(repeating: 1, count: publicKeyLength),
+            "private_key": Data(repeating: 2, count: privateKeyLength),
+            "identifier": identifier
+        ]
+        if includeLockdownFields {
+            propertyList["HostID"] = "host-id"
+            propertyList["SystemBUID"] = "system-buid"
+            propertyList["DeviceCertificate"] = Data([1])
+            propertyList["HostCertificate"] = Data([2])
+            propertyList["HostPrivateKey"] = Data([3])
+            propertyList["RootCertificate"] = Data([4])
+            propertyList["RootPrivateKey"] = Data([5])
+        }
+        return try propertyListData(propertyList)
+    }
+
+    private static func lockdownOnlyPairingData() throws -> Data {
+        try propertyListData([
             "HostID": "host-id",
             "SystemBUID": "system-buid",
             "DeviceCertificate": Data([1]),
@@ -139,7 +204,10 @@ struct ImportTypeIsolationTests {
             "HostPrivateKey": Data([3]),
             "RootCertificate": Data([4]),
             "RootPrivateKey": Data([5])
-        ]
+        ])
+    }
+
+    private static func propertyListData(_ propertyList: [String: Any]) throws -> Data {
         return try PropertyListSerialization.data(
             fromPropertyList: propertyList,
             format: .binary,

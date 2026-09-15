@@ -19,6 +19,30 @@ export function refundReconciliationDecision({
   };
 }
 
+/**
+ * Decide whether a refund marker can be completed after the provider detail
+ * read.  Redirect/refund callbacks are not terminal proof: only a scoped
+ * Portaly subscription whose authoritative status is `canceled` is safe to
+ * finish.  Renewable, cancel-requested, and unknown states stay retryable.
+ */
+export function deletedAccountRefundOutcome({
+  subscriptionId,
+  expectedSubscriptionId,
+  planId,
+  expectedPlanId,
+  mode,
+  expectedMode,
+  subscriptionStatus,
+} = {}) {
+  const sameNonBlank = (actual, expected) => typeof actual === "string" &&
+    typeof expected === "string" && actual.trim().length > 0 &&
+    expected.trim().length > 0 && actual === expected;
+  const scoped = sameNonBlank(subscriptionId, expectedSubscriptionId) &&
+    sameNonBlank(planId, expectedPlanId) &&
+    sameNonBlank(mode, expectedMode);
+  return scoped && subscriptionStatus === "canceled" ? "complete" : "retry";
+}
+
 export function refundReconciliationLeaseMatches({
   marker = null,
   leaseId,

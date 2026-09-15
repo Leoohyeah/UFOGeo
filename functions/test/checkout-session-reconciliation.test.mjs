@@ -119,6 +119,95 @@ test("production refresh path verifies and finalizes only provider checkout term
   }
 });
 
+test("a terminal old checkout cannot block a newer completed checkout for the same member", async () => {
+  let oldSessionStatus = "response_incomplete";
+  let oldLockPresent = true;
+  const oldUser = pendingUser({
+    subscriptionId: "session-old",
+    currentCheckoutSessionId: "session-old",
+  });
+  const oldPath = productionPath({
+    user: oldUser,
+    lock: uncertainLock({sessionId: "session-old"}),
+    loadSession: async () => localSession({
+      sessionId: "session-old",
+      subscriptionId: "session-old",
+      status: oldSessionStatus,
+    }),
+    queryCheckoutSession: async () => providerSession("expired", {
+      sessionId: "session-old",
+    }),
+    persistTerminal: async ({providerStatus}) => {
+      oldSessionStatus = "checkout_failed";
+      oldLockPresent = false;
+      return {kind: "terminal_persisted", status: providerStatus};
+    },
+  });
+
+  assert.deepEqual(await oldPath.run(), {
+    kind: "terminal_persisted",
+    status: "expired",
+  });
+  assert.equal(oldSessionStatus, "checkout_failed");
+  assert.equal(oldLockPresent, false);
+  assert.equal(checkoutSessionReconciliationTarget({
+    ...context,
+    user: {
+      ...oldUser,
+      proActive: false,
+      subscriptionStatus: "checkout_failed",
+      subscriptionId: null,
+    },
+    lock: null,
+  }), null);
+
+  const newUser = pendingUser({
+    subscriptionId: "session-new",
+    currentCheckoutSessionId: "session-new",
+  });
+  let newState;
+  const newPath = productionPath({
+    user: newUser,
+    lock: uncertainLock({sessionId: "session-new"}),
+    loadSession: async () => localSession({
+      sessionId: "session-new",
+      subscriptionId: "session-new",
+      merchantOrderNumber: "order-2",
+    }),
+    queryCheckoutSession: async (sessionId) => providerSession("completed", {
+      sessionId,
+      merchantOrderNumber: "order-2",
+    }),
+    reconcileCompleted: async ({target, localSession}) => {
+      newState = {
+        subscriptionId: target.sessionId,
+        currentCheckoutSessionId: target.sessionId,
+        subscriptionStatus: "active",
+        proActive: true,
+        oldSessionStatus,
+        newSessionStatus: "active",
+        oldLockPresent,
+      };
+      assert.equal(localSession.sessionId, "session-new");
+      return {kind: "subscription_reconciled", lookupId: target.sessionId};
+    },
+  });
+
+  assert.deepEqual(await newPath.run(), {
+    kind: "subscription_reconciled",
+    lookupId: "session-new",
+  });
+  assert.deepEqual(newState, {
+    subscriptionId: "session-new",
+    currentCheckoutSessionId: "session-new",
+    subscriptionStatus: "active",
+    proActive: true,
+    oldSessionStatus: "checkout_failed",
+    newSessionStatus: "active",
+    oldLockPresent: false,
+  });
+});
+
 test("lock-only completed checkout supplies its verified target as subscription lookup fallback", async () => {
   const path = productionPath({
     user: {},
@@ -139,6 +228,129 @@ test("lock-only completed checkout supplies its verified target as subscription 
     ["query", "session-1"],
     ["subscription", "session-1"],
   ]);
+});
+
+test("callback-resolved local sessions bypass stale pending snapshots and reconcile the subscription", async () => {
+  for (const [status, user] of [
+    ["active", pendingUser()],
+    ["completed", pendingUser()],
+    ["active", {}],
+  ]) {
+    const path = productionPath({
+      user,
+      loadSession: async (sessionId) => {
+        path.calls.push(["load", sessionId]);
+        return localSession({status});
+      },
+      queryCheckoutSession: async () => {
+        throw new Error("resolved checkout must not be queried as pending");
+      },
+    });
+
+    const result = await path.run();
+
+    assert.deepEqual(result, {
+      kind: "subscription_reconciled",
+      lookupId: "session-1",
+    });
+    assert.deepEqual(path.calls, [
+      ["load", "session-1"],
+      ["subscription", "session-1"],
+    ]);
+  }
+});
+
+test("regression: timeout-retry flow should still reconcile when the local checkout session is missing", async () => {
+  const path = productionPath({
+    loadSession: async (sessionId) => {
+      path.calls.push(["load", sessionId]);
+      return null;
+    },
+    queryCheckoutSession: async (sessionId) => {
+      path.calls.push(["query", sessionId]);
+      return providerSession("completed", {sessionId});
+    },
+    reconcileCompleted: async ({target}) => {
+      path.calls.push(["subscription", target.sessionId]);
+      return {kind: "subscription_reconciled", lookupId: target.sessionId};
+    },
+  });
+
+  const result = await path.run();
+
+  assert.deepEqual(result, {
+    kind: "subscription_reconciled",
+    lookupId: "session-1",
+  });
+  assert.deepEqual(path.calls, [
+    ["load", "session-1"],
+    ["query", "session-1"],
+    ["subscription", "session-1"],
+  ]);
+});
+
+test("missing local session with provider pending still fails closed", async () => {
+  const path = productionPath({
+    loadSession: async (sessionId) => {
+      path.calls.push(["load", sessionId]);
+      return null;
+    },
+    queryCheckoutSession: async (sessionId) => {
+      path.calls.push(["query", sessionId]);
+      return providerSession("checkout_ready", {sessionId});
+    },
+  });
+
+  await assert.rejects(path.run(), (error) =>
+    error?.code === "CHECKOUT_RECONCILIATION_SESSION_MISSING");
+  assert.deepEqual(path.calls, [
+    ["load", "session-1"],
+    ["query", "session-1"],
+  ]);
+  assert.equal(path.calls.some(([kind]) => kind === "terminal"), false);
+  assert.equal(path.calls.some(([kind]) => kind === "subscription"), false);
+});
+
+test("missing local session with provider identity mismatch still fails closed", async () => {
+  const path = productionPath({
+    loadSession: async (sessionId) => {
+      path.calls.push(["load", sessionId]);
+      return null;
+    },
+    queryCheckoutSession: async (sessionId) => {
+      path.calls.push(["query", sessionId]);
+      return providerSession("completed", {
+        sessionId,
+        customer: {email: "other@example.com"},
+      });
+    },
+  });
+
+  await assert.rejects(path.run(), (error) =>
+    error?.code === "PORTALY_CHECKOUT_EMAIL_MISMATCH");
+  assert.deepEqual(path.calls, [
+    ["load", "session-1"],
+    ["query", "session-1"],
+  ]);
+  assert.equal(path.calls.some(([kind]) => kind === "terminal"), false);
+  assert.equal(path.calls.some(([kind]) => kind === "subscription"), false);
+});
+
+test("callback-resolved sessions still fail closed for a different UID or session", async () => {
+  for (const session of [
+    localSession({status: "active", uid: "uid-other"}),
+    localSession({status: "completed", sessionId: "session-other"}),
+    localSession({status: "active", accountDeleted: true}),
+  ]) {
+    const path = productionPath({loadSession: async () => session});
+    await assert.rejects(path.run(), (error) => [
+      "CHECKOUT_RECONCILIATION_UID_MISMATCH",
+      "CHECKOUT_RECONCILIATION_SESSION_ID_MISMATCH",
+      "CHECKOUT_RECONCILIATION_SESSION_STATE_CHANGED",
+    ].includes(error.code));
+    assert.equal(path.calls.some(([kind]) => kind === "query"), false);
+    assert.equal(path.calls.some(([kind]) => kind === "subscription"), false);
+  }
 });
 
 test("production refresh path keeps pending checkout and lock untouched", async () => {

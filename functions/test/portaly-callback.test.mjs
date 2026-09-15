@@ -12,10 +12,14 @@ import {
   validateCallbackPayload,
   verifyCallbackEnvelope,
 } from "../portaly-callback.mjs";
+import {
+  callbackMatchesCheckoutSession,
+  shouldApplyUserSubscriptionUpdate,
+} from "../checkout-idempotency.mjs";
 import {signPortalyCallback} from "../portaly-signature.mjs";
 
 const signatureVectors = JSON.parse(readFileSync(
-    new URL(
+  new URL(
     "./fixtures/callback-signature-v1-vectors.json",
     import.meta.url,
   ),
@@ -315,6 +319,100 @@ test("accepts checkout failure without a subscription and keeps Pro disabled", (
   );
 });
 
+test("accepts a production-shaped completed checkout without subscriptionId", () => {
+  const value = fixture({
+    mode: "live",
+    merchantOrderNumber: "ufogeo-order-production-1",
+    amount: 149,
+    currency: "TWD",
+    paymentReference: "txn-production-1",
+    paymentMethod: "tappay",
+    completedAt: "2026-08-26T04:00:00.000Z",
+  });
+  delete value.payload.subscriptionId;
+  value.headers["x-portaly-signature"] = signPortalyCallback({
+    secret: value.secret,
+    payload: value.payload,
+    timestamp: value.headers["x-portaly-timestamp"],
+  });
+
+  assert.equal(verifyCallbackEnvelope(value).event, value.payload.event);
+  assert.equal(validateCallbackPayload(value.payload.event, value.payload), value.payload);
+  assert.equal(subscriptionIdentifier(value.payload), value.payload.sessionId);
+});
+
+test("applies a new session-only completion after an old failed checkout", () => {
+  const value = fixture({
+    mode: "live",
+    sessionId: "session-new",
+    subscriptionId: undefined,
+    status: "completed",
+    completedAt: "2026-08-26T04:00:00.000Z",
+  });
+  value.headers["x-portaly-signature"] = signPortalyCallback({
+    secret: value.secret,
+    payload: value.payload,
+    timestamp: value.headers["x-portaly-timestamp"],
+  });
+  const newSession = {
+    sessionId: "session-new",
+    subscriptionId: "session-new",
+    customerEmail: "buyer@example.com",
+    planId: "plan_fixture",
+    mode: "live",
+    status: "checkout_ready",
+  };
+  const currentUser = {
+    currentCheckoutSessionId: "session-new",
+    subscriptionId: "session-new",
+    mode: "live",
+  };
+
+  // The callback remains signed and is accepted when Portaly omits the
+  // subscriptionId (the contract aliases it to sessionId).
+  assert.equal(verifyCallbackEnvelope(value).event, value.payload.event);
+  assert.equal(validateCallbackPayload(value.payload.event, value.payload), value.payload);
+  assert.equal(subscriptionIdentifier(value.payload), "session-new");
+  assert.equal(callbackMatchesCheckoutSession(newSession, value.payload, {
+    expectedPlanId: "plan_fixture",
+  }), true);
+  assert.deepEqual(
+    subscriptionStateForEvent(value.payload.event, value.payload),
+    {proActive: true, subscriptionStatus: "active", cancelAtPeriodEnd: false},
+  );
+  assert.equal(
+    shouldApplyUserSubscriptionUpdate(currentUser, "session-new", {mode: "live"}),
+    true,
+  );
+
+  // A late callback for the expired/failed first checkout may update its own
+  // history, but must not overwrite the user's newer checkout entitlement.
+  assert.equal(
+    shouldApplyUserSubscriptionUpdate(currentUser, "session-old", {mode: "live"}),
+    false,
+  );
+
+  const mismatched = fixture({
+    mode: "live",
+    sessionId: "session-new",
+    subscriptionId: "session-old",
+    status: "completed",
+  });
+  mismatched.headers["x-portaly-signature"] = signPortalyCallback({
+    secret: mismatched.secret,
+    payload: mismatched.payload,
+    timestamp: mismatched.headers["x-portaly-timestamp"],
+  });
+  assert.doesNotThrow(() => verifyCallbackEnvelope(mismatched));
+  assert.throws(
+    () => validateCallbackPayload(mismatched.payload.event, mismatched.payload),
+    (error) => error instanceof CallbackError && error.statusCode === 400,
+  );
+  assert.equal(callbackMatchesCheckoutSession(newSession, mismatched.payload, {
+    expectedPlanId: "plan_fixture",
+  }), false);
+});
+
 test("accepts every documented callback identity and payment status", () => {
   const validPayloads = [
     fixture().payload,
@@ -416,7 +514,6 @@ test("rejects refund callbacks without order identity or terminal proof", () => 
 test("rejects missing or conflicting callback identifiers", () => {
   for (const payload of [
     fixture({sessionId: undefined}).payload,
-    fixture({subscriptionId: undefined}).payload,
     fixture({subscriptionId: "different_subscription"}).payload,
     fixture({
       event: "creator_subscription.checkout.failed",

@@ -192,7 +192,6 @@ export function validateCallbackPayload(event, payload) {
   switch (canonicalEvent) {
   case "creator_subscription.checkout.completed":
     requiredPayloadString(payload, "sessionId");
-    requiredPayloadString(payload, "subscriptionId");
     if (payload.status !== "completed") {
       throw new CallbackError(422, "Checkout callback is not completed");
     }

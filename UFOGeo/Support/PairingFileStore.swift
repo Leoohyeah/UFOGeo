@@ -32,14 +32,13 @@ enum PairingFileError: LocalizedError, Equatable {
 enum PairingFileStore {
     private static let fileName = "rp_pairing_file.plist"
     private static let maximumFileSize = 10 * 1_024 * 1_024
-    private static let requiredStringFields = ["HostID", "SystemBUID"]
-    private static let requiredDataFields = [
-        "DeviceCertificate",
-        "HostCertificate",
-        "HostPrivateKey",
-        "RootCertificate",
-        "RootPrivateKey"
+    private static let requiredRemotePairingFields = [
+        "public_key",
+        "private_key",
+        "identifier"
     ]
+    private static let remotePairingKeyFields = ["public_key", "private_key"]
+    private static let remotePairingKeyLength = 32
     static let supportedContentTypes: [UTType] = [
         // Use extension-tagged dynamic types rather than a generic `.data`
         // or `.propertyList` type. UIDocumentPicker will then limit manual
@@ -109,21 +108,21 @@ enum PairingFileStore {
             throw PairingFileError.invalidPropertyList
         }
 
-        let missing = (requiredStringFields + requiredDataFields).filter {
+        let missing = requiredRemotePairingFields.filter {
             dictionary[$0] == nil
         }
         guard missing.isEmpty else {
             throw PairingFileError.missingRequiredFields(missing)
         }
 
-        for field in requiredStringFields {
-            guard let value = dictionary[field] as? String,
-                  !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                throw PairingFileError.invalidField(field)
-            }
+        guard let identifier = dictionary["identifier"] as? String,
+              !identifier.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw PairingFileError.invalidField("identifier")
         }
-        for field in requiredDataFields {
-            guard let value = dictionary[field] as? Data, !value.isEmpty else {
+
+        for field in remotePairingKeyFields {
+            guard let value = dictionary[field] as? Data,
+                  value.count == remotePairingKeyLength else {
                 throw PairingFileError.invalidField(field)
             }
         }

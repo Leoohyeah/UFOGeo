@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   accountDeletionTombstoneWrite,
+  accountDeletionCanSkipCustomerTombstone,
   accountDeletionGuardDecision,
   completedAccountDeletionMatches,
   createPortalSessionReservation,
@@ -65,6 +66,15 @@ test("uses a merge set for an account-deletion tombstone containing delete senti
   assert.equal(write.data.updatedAt, timestampSentinel);
 });
 
+test("skips the email tombstone only after provider renewable-state proof", () => {
+  assert.equal(accountDeletionCanSkipCustomerTombstone({
+    providerHasRenewableSubscription: false,
+  }), true);
+  assert.equal(accountDeletionCanSkipCustomerTombstone({
+    providerHasRenewableSubscription: true,
+  }), false);
+});
+
 test("accepts only a matching and confirmed Portaly cancellation response", () => {
   const expected = {subscriptionId: "sub_expected"};
   for (const value of [
@@ -92,7 +102,7 @@ test("rejects wrong, missing, false, or malformed cancellation confirmations", (
     [{id: "sub_expected", status: "active", cancelAtPeriodEnd: false}, "SUBSCRIPTION_CANCEL_NOT_CONFIRMED"],
     [{id: "sub_expected", status: "past_due", cancelAtPeriodEnd: false}, "SUBSCRIPTION_CANCEL_NOT_CONFIRMED"],
     [{id: "sub_expected", cancelAtPeriodEnd: true}, "SUBSCRIPTION_CANCEL_STATUS_INVALID"],
-    [{id: "sub_expected", status: "cancel_requested", cancelAtPeriodEnd: false}, "SUBSCRIPTION_CANCEL_STATUS_INVALID"],
+    [{id: "sub_expected", status: "cancel_requested", cancelAtPeriodEnd: false}, "SUBSCRIPTION_CANCEL_NOT_CONFIRMED"],
     [{id: "sub_expected", status: "CANCELED", cancelAtPeriodEnd: false}, "SUBSCRIPTION_CANCEL_STATUS_INVALID"],
     [{id: "sub_expected", status: "canceled"}, "SUBSCRIPTION_CANCEL_CONFIRMATION_MISSING"],
     [{id: "sub_expected", status: "canceled", cancelAtPeriodEnd: "false"}, "SUBSCRIPTION_CANCEL_CONFIRMATION_MISSING"],

@@ -473,7 +473,7 @@ final class PortalyCheckoutService: ObservableObject {
                 case .checkoutFailed:
                     label = "付款未完成"
                     detail = "未啟用 Pro。"
-                    guidance = "狀態確認後可再試，請勿重複付款。"
+                    guidance = "請先重新同步確認付款結果；確認前請勿重複付款。"
                     tone = .attention
                     action = emailVerified ? .retryCheckout : .none
                 case .canceled:
@@ -607,6 +607,14 @@ final class PortalyCheckoutService: ObservableObject {
         case notFound
     }
 
+    enum MembershipSyncOutcome: Equatable {
+        case idle
+        case inFlight(uid: String)
+        case succeeded(uid: String)
+        case failed(uid: String)
+        case cancelled(uid: String)
+    }
+
     enum SubscriptionRecoveryState: Equatable {
         case idle
         case inFlight
@@ -616,14 +624,43 @@ final class PortalyCheckoutService: ObservableObject {
         case ambiguous
         case unavailable
         case conflict
+        case safetyHold
 
         var blocksCheckout: Bool {
             switch self {
-            case .inFlight, .ambiguous, .unavailable, .conflict:
+            case .inFlight, .ambiguous, .unavailable, .conflict, .safetyHold:
                 return true
             case .idle, .recovered, .alreadyBound, .notFound:
                 return false
             }
+        }
+    }
+
+    /// Shared membership operations may outlive the auth session that
+    /// started them.  A result can only be reused by the same Firebase UID;
+    /// a missing UID is never a valid owner.
+    nonisolated static func requestTaskBelongsToCurrentUID(
+        ownerUID: String?,
+        currentUID: String?
+    ) -> Bool {
+        guard let ownerUID, let currentUID else { return false }
+        return ownerUID == currentUID
+    }
+
+    nonisolated static func initialSyncFlags(
+        outcome: MembershipSyncOutcome,
+        currentUID: String?
+    ) -> (completed: Bool, failed: Bool) {
+        guard let currentUID else { return (false, false) }
+        switch outcome {
+        case .succeeded(let uid) where uid == currentUID:
+            return (true, false)
+        case .failed(let uid) where uid == currentUID:
+            return (false, true)
+        case .cancelled(let uid) where uid == currentUID:
+            return (false, true)
+        case .idle, .inFlight, .succeeded, .failed, .cancelled:
+            return (false, false)
         }
     }
 
@@ -646,33 +683,35 @@ final class PortalyCheckoutService: ObservableObject {
                !serverMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 return serverMessage
             }
-            return "付款建立結果尚未確認，請先重新同步；確認前請勿重複付款。"
+            return "付款建立結果尚未確認，\(Self.checkoutSyncFirstGuidance)"
         case "PORTALY_RECONCILE_REQUEST_UNCERTAIN", "PORTALY_RECONCILE_FAILED",
              "PORTALY_RECONCILE_RESPONSE_INVALID":
             if let serverMessage,
                !serverMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 return serverMessage
             }
-            return "付款狀態尚未確認，請先重新同步；確認前請勿重複付款。"
+            return "付款狀態尚未確認，\(Self.checkoutSyncFirstGuidance)"
         case "CHECKOUT_SAFETY_HOLD":
             if let serverMessage,
                !serverMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 return serverMessage
             }
-            return "付款或帳號狀態尚未確認，為避免重複扣款，請先重新同步；確認前請勿重複付款。"
+            return "付款或帳號狀態尚未確認，\(Self.accountSyncFirstGuidance)"
+        case "ACCOUNT_DELETION_SAFETY_HOLD", "SUBSCRIPTION_RECOVERY_SAFETY_HOLD":
+            return "刪帳安全確認尚未完成，請稍後再試。"
         case "PENDING_CHECKOUT_EXISTS", "RECOVERY_PENDING_CHECKOUT":
             if let serverMessage,
                !serverMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 return serverMessage
             }
-            return "目前仍有尚未完成的付款流程，請先重新同步並等待流程確認；確認前請勿重複付款。"
+            return "目前仍有尚未完成的付款流程，付款結果尚未確認，\(Self.checkoutSyncFirstGuidance)"
         case "PORTALY_RECOVERY_CONFLICT", "SUBSCRIPTION_RECOVERY_CONFLICT",
              "RECOVERY_LOCAL_STATE_CONFLICT", "RECOVERY_EXISTING_BINDING_CONFLICT":
             return "目前帳號已有不同的訂閱狀態，為避免覆寫資料，請重新同步或聯絡支援。"
         case "PORTALY_RECOVERY_UNAVAILABLE", "SUBSCRIPTION_RECOVERY_UNAVAILABLE",
              "PORTALY_RECOVERY_LIST_FAILED", "PORTALY_RECOVERY_PROVIDER_FAILED",
              "PORTALY_RECOVERY_RESPONSE_INVALID", "PORTALY_RECOVERY_STATE_CHANGED":
-            return "目前無法確認 Portaly 訂閱。為避免重複付款，請稍後再試。"
+            return "目前無法確認 Portaly 訂閱，付款狀態尚未確認。\(Self.checkoutSyncFirstGuidance)"
         case "PORTALY_RECOVERY_NOT_FOUND", "SUBSCRIPTION_RECOVERY_NOT_FOUND":
             return "目前沒有找到可恢復的 Portaly Pro 訂閱；若要使用 Pro，可以開始新的訂閱。"
         case "EMAIL_NOT_VERIFIED":
@@ -692,11 +731,18 @@ final class PortalyCheckoutService: ObservableObject {
     @Published private(set) var subscription: SubscriptionState?
     @Published private(set) var isEntitlementCacheExpired = true
     @Published private(set) var recoveryState: SubscriptionRecoveryState = .idle
+    @Published private(set) var membershipSyncOutcome: MembershipSyncOutcome = .idle
 
     private static let checkoutCooldownSeconds: TimeInterval = 30
     private static let checkoutLockPrefix = "ufogeo.checkout-lock."
     private static let subscriptionReconcilePrefix = "ufogeo.subscription-reconcile."
+    private static let checkoutReturnReconcilePrefix = "ufogeo.checkout-return-reconcile."
+    nonisolated private static let checkoutReturnReconcileRetryLimit = 1
     private static let subscriptionReconcileRetryDelayNanoseconds: UInt64 = 1_000_000_000
+    nonisolated private static let checkoutSyncFirstGuidance =
+        "為避免重複付款，請先重新同步並等待確認；若既有付款有效，同步後可恢復。"
+    nonisolated private static let accountSyncFirstGuidance =
+        "為避免重複付款，請先重新同步並等待確認；若既有訂閱有效，同步後可恢復。"
 
     var isCheckoutLocked: Bool {
         guard let uid = authService.session?.uid else { return false }
@@ -714,7 +760,7 @@ final class PortalyCheckoutService: ObservableObject {
     var shouldOfferSubscriptionRecovery: Bool {
         guard let session = authService.session,
               session.emailVerified,
-              recoveryState != .inFlight,
+              !isRecoveryRequestInFlight,
               recoveryState != .recovered,
               recoveryState != .alreadyBound else { return false }
 
@@ -739,11 +785,36 @@ final class PortalyCheckoutService: ObservableObject {
     }
 
     var recoveryBlocksCheckout: Bool {
-        recoveryState.blocksCheckout
+        recoveryState == .inFlight ? isRecoveryRequestInFlight : recoveryState.blocksCheckout
     }
 
     var isRecoveryRequestInFlight: Bool {
         recoveryState == .inFlight
+            && Self.requestTaskBelongsToCurrentUID(
+                ownerUID: recoveryTaskUID,
+                currentUID: authService.session?.uid
+            )
+    }
+
+    var isLoadingForCurrentSession: Bool {
+        guard let uid = authService.session?.uid else { return false }
+        return (loadingRequestCounts[uid] ?? 0) > 0
+    }
+
+    var isCheckoutRequestInFlightForCurrentSession: Bool {
+        isCheckoutRequestInFlight
+            && Self.requestTaskBelongsToCurrentUID(
+                ownerUID: checkoutRequestUID,
+                currentUID: authService.session?.uid
+            )
+    }
+
+    var isPortalRequestInFlightForCurrentSession: Bool {
+        isPortalRequestInFlight
+            && Self.requestTaskBelongsToCurrentUID(
+                ownerUID: portalRequestUID,
+                currentUID: authService.session?.uid
+            )
     }
 
     var recoveryStatusMessage: String? {
@@ -759,9 +830,11 @@ final class PortalyCheckoutService: ObservableObject {
         case .ambiguous:
             return "找到多筆可用的 Portaly 訂閱，為避免綁定錯誤，尚未變更帳號。請聯絡支援。"
         case .unavailable:
-            return "目前無法確認 Portaly 訂閱。為避免重複付款，請稍後再試。"
+            return "目前無法確認 Portaly 訂閱，付款狀態尚未確認。\(Self.checkoutSyncFirstGuidance)"
         case .conflict:
             return "目前帳號已有不同的訂閱狀態，為避免覆寫資料，請重新同步或聯絡支援。"
+        case .safetyHold:
+            return "刪帳安全確認尚未完成，請稍後再試。"
         }
     }
 
@@ -775,7 +848,7 @@ final class PortalyCheckoutService: ObservableObject {
             return "checkmark.seal.fill"
         case .notFound:
             return "info.circle"
-        case .ambiguous, .unavailable, .conflict:
+        case .ambiguous, .unavailable, .conflict, .safetyHold:
             return "exclamationmark.triangle.fill"
         }
     }
@@ -804,6 +877,13 @@ final class PortalyCheckoutService: ObservableObject {
             isCacheExpired: isEntitlementCacheExpired,
             initialSyncCompleted: initialSyncCompleted,
             syncFailed: syncFailed
+        )
+    }
+
+    var membershipSyncFlagsForCurrentSession: (completed: Bool, failed: Bool) {
+        Self.initialSyncFlags(
+            outcome: membershipSyncOutcome,
+            currentUID: authService.session?.uid
         )
     }
 
@@ -844,14 +924,6 @@ final class PortalyCheckoutService: ObservableObject {
             lastAttemptAt: lastEntitlementRefreshAttemptAt,
             interval: Self.effectiveEntitlementRefreshInterval(expiringStage: subscription?.expiringStage)
         )
-    }
-
-    var hasRecentlyValidatedEntitlement: Bool {
-        guard let uid = authService.session?.uid,
-              subscription?.uid == uid,
-              let entitlementValidatedAt else { return false }
-        let age = Date().timeIntervalSince(entitlementValidatedAt)
-        return age >= 0 && age < Self.entitlementRefreshInterval
     }
 
     var canUseJoystick: Bool {
@@ -948,6 +1020,19 @@ final class PortalyCheckoutService: ObservableObject {
         return !stateIsUnchanged
     }
 
+    nonisolated static func armCheckoutReturnReconcileRetries(
+        current: Int,
+        limit: Int = checkoutReturnReconcileRetryLimit
+    ) -> Int {
+        max(current, max(limit, 0))
+    }
+
+    nonisolated static func consumeCheckoutReturnReconcileRetries(
+        current: Int
+    ) -> Int {
+        max(current - 1, 0)
+    }
+
     private struct CheckoutResponse: Decodable {
         let checkoutUrl: URL
     }
@@ -970,6 +1055,11 @@ final class PortalyCheckoutService: ObservableObject {
         let cachedAt: Date
     }
 
+    private struct QueuedPortalyReturn: Equatable {
+        let flow: PortalyReturnFlow
+        let uid: String
+    }
+
     enum PortalyReturnFlow: String, Equatable {
         case checkout
         case portal
@@ -989,25 +1079,36 @@ final class PortalyCheckoutService: ObservableObject {
     private(set) var needsSubscriptionReconcile = false
     private var reconcileMarkerUID: String?
     private var reconciliationInFlightID: UUID?
+    private var reconciliationInFlightUID: String?
     private var foregroundSyncTask: Task<Void, Error>?
     private var foregroundSyncID: UUID?
-    private var portalyReturnQueue: [PortalyReturnFlow] = []
-    private var portalyReturnRetryQueue: [PortalyReturnFlow] = []
+    private var foregroundSyncUID: String?
+    private var portalyReturnQueue: [QueuedPortalyReturn] = []
+    private var portalyReturnRetryQueue: [QueuedPortalyReturn] = []
     private var portalyReturnProcessorTask: Task<Void, Never>?
     private var portalyReturnProcessorID: UUID?
+    private var portalyReturnProcessorUID: String?
     private var subscriptionRefreshTask: Task<SubscriptionState, Error>?
     private var subscriptionRefreshID: UUID?
+    private var subscriptionRefreshUID: String?
+    private var checkoutRequestUID: String?
+    private var portalRequestUID: String?
     private var recoveryTask: Task<SubscriptionRecoveryOutcome, Error>?
     private var recoveryTaskID: UUID?
+    private var recoveryTaskUID: String?
     private var recoveryAttemptedIdentity: String?
+    private var lastKnownSessionUID: String?
     private var entitlementValidatedAt: Date?
     private var lastEntitlementRefreshAttemptAt: Date?
     private var entitlementExpiryTask: Task<Void, Never>?
-    private var loadingRequestCount = 0
+    private var loadingRequestCounts: [String: Int] = [:]
+    private var checkoutReturnReconcileUID: String?
+    private var checkoutReturnReconcileRetries = 0
 
     init(authService: FirebaseAuthService? = nil) {
         let resolvedAuthService = authService ?? FirebaseAuthService.shared
         self.authService = resolvedAuthService
+        self.lastKnownSessionUID = resolvedAuthService.session?.uid
         
         // 配置帶有適當超時的 URLSession
         let config = URLSessionConfiguration.default
@@ -1133,6 +1234,7 @@ final class PortalyCheckoutService: ObservableObject {
     func recoverSubscription(
         force: Bool = false
     ) async throws -> SubscriptionRecoveryOutcome {
+        prepareForCurrentAuthSession()
         guard let expectedSession = authService.session else {
             throw CheckoutError.server("請先登入 UFOGeo 帳號後再試。")
         }
@@ -1187,7 +1289,8 @@ final class PortalyCheckoutService: ObservableObject {
                 _ = try await authService.validIDToken(forceRefresh: true)
                 let response: SubscriptionRecoveryResponse = try await authenticatedRequest(
                     path: "/api/portaly/subscription/recover",
-                    method: "POST"
+                    method: "POST",
+                    ownerUID: expectedUID
                 )
                 guard recoveryTaskID == operationID,
                       authService.session?.uid == expectedUID else {
@@ -1220,6 +1323,10 @@ final class PortalyCheckoutService: ObservableObject {
                 }
                 throw CancellationError()
             } catch {
+                guard recoveryTaskID == operationID,
+                      authService.session?.uid == expectedUID else {
+                    throw CancellationError()
+                }
                 let failedState = Self.recoveryState(for: error)
                 recoveryState = failedState
                 if failedState == .notFound {
@@ -1232,24 +1339,27 @@ final class PortalyCheckoutService: ObservableObject {
             }
         }
         recoveryTaskID = operationID
+        recoveryTaskUID = expectedUID
         recoveryTask = task
         defer {
             if recoveryTaskID == operationID {
                 recoveryTask = nil
                 recoveryTaskID = nil
+                recoveryTaskUID = nil
             }
         }
         return try await task.value
     }
 
     func createCheckoutURL() async throws -> URL {
+        prepareForCurrentAuthSession()
         guard !recoveryState.blocksCheckout else {
             throw CheckoutError.serverResponse(
                 code: "PORTALY_RECOVERY_REQUIRED",
                 message: "目前正在確認既有 Portaly 訂閱，為避免重複付款，請先完成恢復或重新嘗試。"
             )
         }
-        guard !isCheckoutRequestInFlight else {
+        guard !isCheckoutRequestInFlightForCurrentSession else {
             throw CheckoutError.checkoutRequestInFlight
         }
         guard let uid = authService.session?.uid else {
@@ -1263,9 +1373,13 @@ final class PortalyCheckoutService: ObservableObject {
         }
         UserDefaults.standard.set(now, forKey: key)
         isCheckoutRequestInFlight = true
+        checkoutRequestUID = uid
         var shouldKeepCheckoutLock = false
         defer {
-            isCheckoutRequestInFlight = false
+            if checkoutRequestUID == uid {
+                isCheckoutRequestInFlight = false
+                checkoutRequestUID = nil
+            }
             if !shouldKeepCheckoutLock {
                 UserDefaults.standard.removeObject(forKey: key)
             }
@@ -1276,45 +1390,75 @@ final class PortalyCheckoutService: ObservableObject {
         _ = try await authService.validIDToken(forceRefresh: true)
         let response: CheckoutResponse = try await authenticatedRequest(
             path: "/api/portaly/checkout",
-            method: "POST"
+            method: "POST",
+            ownerUID: uid
         )
         guard response.checkoutUrl.scheme == "https" else {
             throw CheckoutError.invalidResponse
+        }
+        guard authService.session?.uid == uid else {
+            throw CancellationError()
         }
         shouldKeepCheckoutLock = true
         return response.checkoutUrl
     }
 
     func createPortalURL() async throws -> URL {
-        guard !isPortalRequestInFlight else {
+        prepareForCurrentAuthSession()
+        guard !isPortalRequestInFlightForCurrentSession else {
             throw CheckoutError.portalRequestInFlight
         }
+        guard let expectedUID = authService.session?.uid else {
+            throw CheckoutError.server("請先登入 UFOGeo 帳號後再試。")
+        }
         isPortalRequestInFlight = true
-        defer { isPortalRequestInFlight = false }
+        portalRequestUID = expectedUID
+        defer {
+            if portalRequestUID == expectedUID {
+                isPortalRequestInFlight = false
+                portalRequestUID = nil
+            }
+        }
 
         let response: PortalResponse = try await authenticatedRequest(
             path: "/api/portaly/portal",
-            method: "POST"
+            method: "POST",
+            ownerUID: expectedUID
         )
         guard response.portalUrl.scheme == "https" else { throw CheckoutError.invalidResponse }
+        guard authService.session?.uid == expectedUID else {
+            throw CancellationError()
+        }
         return response.portalUrl
     }
 
     func deleteMemberAccount() async throws {
+        prepareForCurrentAuthSession()
+        guard let expectedUID = authService.session?.uid else {
+            throw CheckoutError.server("請先登入 UFOGeo 帳號後再試。")
+        }
         let response: AccountDeletionResponse = try await authenticatedRequest(
             path: "/api/account",
-            method: "DELETE"
+            method: "DELETE",
+            ownerUID: expectedUID
         )
+        guard authService.session?.uid == expectedUID else {
+            throw CancellationError()
+        }
         guard response.deleted else { throw CheckoutError.invalidResponse }
         clearLocalState()
     }
 
     @discardableResult
     func refreshSubscription(force: Bool = false) async throws -> SubscriptionState {
+        prepareForCurrentAuthSession()
+        guard let expectedUID = authService.session?.uid else {
+            throw CheckoutError.server("請先登入 UFOGeo 帳號後再試。")
+        }
+
         if !force,
-           let uid = authService.session?.uid,
            let cache = Self.readCache(),
-           cache.value.uid == uid,
+           cache.value.uid == expectedUID,
            Self.cacheIsFresh(cachedAt: cache.cachedAt) {
             subscription = cache.value
             entitlementValidatedAt = cache.cachedAt
@@ -1328,9 +1472,6 @@ final class PortalyCheckoutService: ObservableObject {
             return try await subscriptionRefreshTask.value
         }
 
-        guard let expectedUID = authService.session?.uid else {
-            throw CheckoutError.server("請先登入 UFOGeo 帳號後再試。")
-        }
         lastEntitlementRefreshAttemptAt = Date()
         let refreshID = UUID()
         let task = Task { @MainActor in
@@ -1338,7 +1479,8 @@ final class PortalyCheckoutService: ObservableObject {
             do {
                 value = try await authenticatedRequest(
                     path: "/api/portaly/subscription",
-                    method: "GET"
+                    method: "GET",
+                    ownerUID: expectedUID
                 )
             } catch {
                 invalidateEntitlementCacheIfNeeded(for: error, expectedUID: expectedUID)
@@ -1357,11 +1499,13 @@ final class PortalyCheckoutService: ObservableObject {
             return value
         }
         subscriptionRefreshID = refreshID
+        subscriptionRefreshUID = expectedUID
         subscriptionRefreshTask = task
         defer {
             if subscriptionRefreshID == refreshID {
                 subscriptionRefreshTask = nil
                 subscriptionRefreshID = nil
+                subscriptionRefreshUID = nil
             }
         }
         return try await task.value
@@ -1374,16 +1518,20 @@ final class PortalyCheckoutService: ObservableObject {
     /// Portaly processed a resume request.
     @discardableResult
     func reconcileSubscriptionIfNeeded(force: Bool = false) async throws -> SubscriptionState? {
+        prepareForCurrentAuthSession()
         loadReconcileMarkerIfNeeded()
         guard force || needsSubscriptionReconcile else { return nil }
         guard let reconciliationUID = authService.session?.uid else { return nil }
-        guard reconciliationInFlightID == nil else { return nil }
+        guard reconciliationInFlightID == nil,
+              reconciliationInFlightUID == nil else { return nil }
 
         let operationID = UUID()
         reconciliationInFlightID = operationID
+        reconciliationInFlightUID = reconciliationUID
         defer {
             if reconciliationInFlightID == operationID {
                 reconciliationInFlightID = nil
+                reconciliationInFlightUID = nil
             }
         }
         // A service instance can outlive an auth-session switch. Never use a
@@ -1394,6 +1542,7 @@ final class PortalyCheckoutService: ObservableObject {
         for attempt in 0..<2 {
             try Task.checkCancellation()
             guard reconciliationInFlightID == operationID,
+                  reconciliationInFlightUID == reconciliationUID,
                   authService.session?.uid == reconciliationUID else {
                 throw CancellationError()
             }
@@ -1401,7 +1550,8 @@ final class PortalyCheckoutService: ObservableObject {
             do {
                 response = try await authenticatedRequest(
                     path: "/api/portaly/subscription/reconcile",
-                    method: "POST"
+                    method: "POST",
+                    ownerUID: reconciliationUID
                 )
             } catch {
                 invalidateEntitlementCacheIfNeeded(for: error, expectedUID: reconciliationUID)
@@ -1409,6 +1559,7 @@ final class PortalyCheckoutService: ObservableObject {
             }
             try Task.checkCancellation()
             guard reconciliationInFlightID == operationID,
+                  reconciliationInFlightUID == reconciliationUID,
                   authService.session?.uid == reconciliationUID else {
                 throw CancellationError()
             }
@@ -1435,6 +1586,7 @@ final class PortalyCheckoutService: ObservableObject {
 
             try Task.checkCancellation()
             guard reconciliationInFlightID == operationID,
+                  reconciliationInFlightUID == reconciliationUID,
                   authService.session?.uid == reconciliationUID else {
                 throw CancellationError()
             }
@@ -1453,20 +1605,25 @@ final class PortalyCheckoutService: ObservableObject {
         forceReconcile: Bool? = nil
     ) async throws {
         startPortalyReturnProcessorIfNeeded()
+        guard let uid = authService.session?.uid else { return }
         if let foregroundSyncTask {
             return try await foregroundSyncTask.value
         }
 
         loadReconcileMarkerIfNeeded()
-        guard let uid = authService.session?.uid else { return }
+        loadCheckoutReturnReconcileRetriesIfNeeded()
         let shouldReconcile = forceReconcile ?? (needsSubscriptionReconcile && forceRefresh)
         guard Self.shouldSynchronizeOnForeground(
             subscription: subscription?.uid == uid ? subscription : nil,
             needsReconcile: shouldReconcile,
             needsCheckoutRefresh: forceRefresh
-        ) else { return }
+        ) else {
+            membershipSyncOutcome = .succeeded(uid: uid)
+            return
+        }
 
         let operationID = UUID()
+        membershipSyncOutcome = .inFlight(uid: uid)
         let task = Task { @MainActor in
             defer {
                 // Clear the shared task before this task becomes observable as
@@ -1474,17 +1631,50 @@ final class PortalyCheckoutService: ObservableObject {
                 if foregroundSyncID == operationID {
                     foregroundSyncTask = nil
                     foregroundSyncID = nil
+                    foregroundSyncUID = nil
                 }
             }
-            if shouldReconcile {
-                _ = try await reconcileSubscriptionIfNeeded(force: true)
-            }
-            _ = try await refreshSubscription(force: true)
-            guard authService.session?.uid == uid else {
+            do {
+                var consumedCheckoutFallbackRetry = false
+                if shouldReconcile {
+                    consumedCheckoutFallbackRetry = consumeCheckoutReturnReconcileRetryIfNeeded()
+                    do {
+                        _ = try await reconcileSubscriptionIfNeeded(force: true)
+                    } catch {
+                        if consumedCheckoutFallbackRetry,
+                           checkoutReturnReconcileRetries == 0 {
+                            // Keep checkout fallback retries finite.
+                            setReconcileMarker(false)
+                        }
+                        throw error
+                    }
+                    if consumedCheckoutFallbackRetry,
+                       checkoutReturnReconcileRetries == 0 {
+                        // Checkout fallback only gets a bounded foreground retry.
+                        setReconcileMarker(false)
+                    }
+                }
+                _ = try await refreshSubscription(force: true)
+                guard foregroundSyncID == operationID,
+                      authService.session?.uid == uid else {
+                    throw CancellationError()
+                }
+                membershipSyncOutcome = .succeeded(uid: uid)
+            } catch is CancellationError {
+                if foregroundSyncID == operationID {
+                    membershipSyncOutcome = .cancelled(uid: uid)
+                }
                 throw CancellationError()
+            } catch {
+                if foregroundSyncID == operationID,
+                   authService.session?.uid == uid {
+                    membershipSyncOutcome = .failed(uid: uid)
+                }
+                throw error
             }
         }
         foregroundSyncID = operationID
+        foregroundSyncUID = uid
         foregroundSyncTask = task
         try await task.value
     }
@@ -1492,19 +1682,22 @@ final class PortalyCheckoutService: ObservableObject {
     /// Receive only an app-owned Portaly deep-link callback. Each accepted
     /// callback is queued, so rapid returns cannot be dropped or overlap.
     func handlePortalyReturnURL(_ url: URL) {
+        guard let uid = authService.session?.uid else { return }
         guard let flow = Self.portalyReturnFlow(from: url) else { return }
         if !portalyReturnRetryQueue.isEmpty {
-            portalyReturnQueue.insert(contentsOf: portalyReturnRetryQueue, at: 0)
-            portalyReturnRetryQueue.removeAll(keepingCapacity: true)
+            let retryItems = portalyReturnRetryQueue.filter { $0.uid == uid }
+            portalyReturnQueue.insert(contentsOf: retryItems, at: 0)
+            portalyReturnRetryQueue.removeAll { $0.uid == uid }
         }
-        portalyReturnQueue.append(flow)
+        portalyReturnQueue.append(.init(flow: flow, uid: uid))
         startPortalyReturnProcessorIfNeeded()
     }
 
     private func startPortalyReturnProcessorIfNeeded() {
+        prepareForCurrentAuthSession()
+        guard let uid = authService.session?.uid else { return }
         guard portalyReturnProcessorTask == nil,
-              !portalyReturnQueue.isEmpty,
-              authService.session?.uid != nil else { return }
+              !portalyReturnQueue.isEmpty else { return }
 
         let processorID = UUID()
         let task = Task { @MainActor in
@@ -1512,6 +1705,7 @@ final class PortalyCheckoutService: ObservableObject {
                 if portalyReturnProcessorID == processorID {
                     portalyReturnProcessorTask = nil
                     portalyReturnProcessorID = nil
+                    portalyReturnProcessorUID = nil
                     // Callbacks received while this batch was awaiting the
                     // server are handled by a fresh task. Failed items remain
                     // in the retry queue until another explicit callback
@@ -1523,36 +1717,56 @@ final class PortalyCheckoutService: ObservableObject {
                 }
             }
 
-            let batch = portalyReturnQueue
+            guard authService.session?.uid == uid else { return }
+            let batch = portalyReturnQueue.filter { $0.uid == uid }
             portalyReturnQueue.removeAll(keepingCapacity: true)
-            for flow in batch {
+            for item in batch {
+                guard authService.session?.uid == uid else { return }
                 do {
-                    try await synchronizeAfterPortalyReturn(flow)
+                    try await synchronizeAfterPortalyReturn(item)
+                } catch is CancellationError {
+                    return
                 } catch {
                     // A failed callback is retained for an explicit retry;
                     // do not spin on a failing network request.
-                    guard portalyReturnProcessorID == processorID else { return }
-                    portalyReturnRetryQueue.append(flow)
+                    guard portalyReturnProcessorID == processorID,
+                          authService.session?.uid == uid else { return }
+                    if item.flow == .checkout {
+                        armCheckoutReturnReconcileRetryIfNeeded()
+                    }
+                    portalyReturnRetryQueue.append(item)
                 }
             }
         }
         portalyReturnProcessorID = processorID
+        portalyReturnProcessorUID = uid
         portalyReturnProcessorTask = task
     }
 
-    private func synchronizeAfterPortalyReturn(_ flow: PortalyReturnFlow) async throws {
-        guard authService.session?.uid != nil else {
+    private func synchronizeAfterPortalyReturn(
+        _ item: QueuedPortalyReturn
+    ) async throws {
+        guard authService.session?.uid == item.uid else {
             throw CheckoutError.server("請先登入 UFOGeo 帳號後再試。")
         }
+        let flow = item.flow
         if flow == .portal {
             // Only an explicit portal callback creates the reconcile marker.
             setReconcileMarker(true)
+            clearCheckoutReturnReconcileRetries()
         }
         // Wait for an initial/session refresh already in flight, then run the
         // callback's own forced request. This preserves checkout GET-only and
         // portal POST-then-GET semantics.
-        if let foregroundSyncTask {
+        if let foregroundSyncTask,
+           Self.requestTaskBelongsToCurrentUID(
+               ownerUID: foregroundSyncUID,
+               currentUID: item.uid
+           ) {
             try await foregroundSyncTask.value
+        }
+        guard authService.session?.uid == item.uid else {
+            throw CancellationError()
         }
         try await synchronizeOnForeground(
             forceRefresh: true,
@@ -1560,26 +1774,170 @@ final class PortalyCheckoutService: ObservableObject {
         )
     }
 
+    /// Cancel or isolate work that belongs to a previous Firebase session.
+    /// Auth can change while a URLSession request is awaiting a response, so
+    /// clearing only the published state is not enough: the old task must no
+    /// longer be reusable by the new member.
+    private func prepareForCurrentAuthSession() {
+        let currentUID = authService.session?.uid
+        if lastKnownSessionUID != currentUID {
+            if let previousUID = lastKnownSessionUID {
+                membershipSyncOutcome = .cancelled(uid: previousUID)
+            } else {
+                membershipSyncOutcome = .idle
+            }
+            lastKnownSessionUID = currentUID
+            subscription = nil
+            entitlementValidatedAt = nil
+            isEntitlementCacheExpired = true
+            entitlementExpiryTask?.cancel()
+            entitlementExpiryTask = nil
+            recoveryAttemptedIdentity = nil
+            recoveryState = .idle
+            reconcileMarkerUID = nil
+            needsSubscriptionReconcile = false
+            checkoutReturnReconcileUID = nil
+            checkoutReturnReconcileRetries = 0
+            KeychainStore.remove(service: Self.keychainService, account: Self.keychainAccount)
+        }
+
+        cancelStaleOperations(for: currentUID)
+        discardPortalyReturnsNotOwnedByCurrentSession()
+    }
+
+    private func cancelStaleOperations(for currentUID: String?) {
+        if !Self.requestTaskBelongsToCurrentUID(
+            ownerUID: reconciliationInFlightUID,
+            currentUID: currentUID
+        ) {
+            reconciliationInFlightID = nil
+            reconciliationInFlightUID = nil
+        }
+
+        if !Self.requestTaskBelongsToCurrentUID(
+            ownerUID: checkoutRequestUID,
+            currentUID: currentUID
+        ) {
+            isCheckoutRequestInFlight = false
+            checkoutRequestUID = nil
+        }
+
+        if !Self.requestTaskBelongsToCurrentUID(
+            ownerUID: portalRequestUID,
+            currentUID: currentUID
+        ) {
+            isPortalRequestInFlight = false
+            portalRequestUID = nil
+        }
+
+        if let task = foregroundSyncTask,
+           !Self.requestTaskBelongsToCurrentUID(
+               ownerUID: foregroundSyncUID,
+               currentUID: currentUID
+           ) {
+            task.cancel()
+            foregroundSyncTask = nil
+            foregroundSyncID = nil
+            foregroundSyncUID = nil
+        }
+
+        if let task = portalyReturnProcessorTask,
+           !Self.requestTaskBelongsToCurrentUID(
+               ownerUID: portalyReturnProcessorUID,
+               currentUID: currentUID
+           ) {
+            task.cancel()
+            portalyReturnProcessorTask = nil
+            portalyReturnProcessorID = nil
+            portalyReturnProcessorUID = nil
+        }
+
+        if let task = subscriptionRefreshTask,
+           !Self.requestTaskBelongsToCurrentUID(
+               ownerUID: subscriptionRefreshUID,
+               currentUID: currentUID
+           ) {
+            task.cancel()
+            subscriptionRefreshTask = nil
+            subscriptionRefreshID = nil
+            subscriptionRefreshUID = nil
+        }
+
+        if let task = recoveryTask,
+           !Self.requestTaskBelongsToCurrentUID(
+               ownerUID: recoveryTaskUID,
+               currentUID: currentUID
+           ) {
+            task.cancel()
+            recoveryTask = nil
+            recoveryTaskID = nil
+            recoveryTaskUID = nil
+            recoveryState = .idle
+        }
+
+        if let currentUID {
+            let staleUIDs = loadingRequestCounts.keys.filter { $0 != currentUID }
+            for uid in staleUIDs {
+                loadingRequestCounts.removeValue(forKey: uid)
+            }
+        } else {
+            loadingRequestCounts.removeAll()
+        }
+        updateLoadingState()
+    }
+
+    private func discardPortalyReturnsNotOwnedByCurrentSession() {
+        guard let currentUID = authService.session?.uid else {
+            portalyReturnQueue.removeAll(keepingCapacity: true)
+            portalyReturnRetryQueue.removeAll(keepingCapacity: true)
+            return
+        }
+        portalyReturnQueue.removeAll { $0.uid != currentUID }
+        portalyReturnRetryQueue.removeAll { $0.uid != currentUID }
+    }
+
+    private func updateLoadingState() {
+        guard let uid = authService.session?.uid else {
+            isLoading = false
+            return
+        }
+        isLoading = (loadingRequestCounts[uid] ?? 0) > 0
+    }
+
     func clearLocalState() {
         let markerUID = authService.session?.uid ?? reconcileMarkerUID
+        let checkoutFallbackUID = authService.session?.uid ?? checkoutReturnReconcileUID
         subscription = nil
         needsSubscriptionReconcile = false
         reconcileMarkerUID = nil
+        checkoutReturnReconcileUID = nil
+        checkoutReturnReconcileRetries = 0
         reconciliationInFlightID = nil
+        reconciliationInFlightUID = nil
         foregroundSyncTask?.cancel()
         foregroundSyncTask = nil
         foregroundSyncID = nil
+        foregroundSyncUID = nil
         portalyReturnProcessorTask?.cancel()
         portalyReturnProcessorTask = nil
         portalyReturnProcessorID = nil
+        portalyReturnProcessorUID = nil
         portalyReturnQueue.removeAll()
         portalyReturnRetryQueue.removeAll()
         subscriptionRefreshTask?.cancel()
         subscriptionRefreshTask = nil
         subscriptionRefreshID = nil
+        subscriptionRefreshUID = nil
+        isCheckoutRequestInFlight = false
+        checkoutRequestUID = nil
+        isPortalRequestInFlight = false
+        portalRequestUID = nil
+        loadingRequestCounts.removeAll()
+        isLoading = false
         recoveryTask?.cancel()
         recoveryTask = nil
         recoveryTaskID = nil
+        recoveryTaskUID = nil
         recoveryAttemptedIdentity = nil
         recoveryState = .idle
         entitlementExpiryTask?.cancel()
@@ -1588,10 +1946,21 @@ final class PortalyCheckoutService: ObservableObject {
         lastEntitlementRefreshAttemptAt = nil
         isEntitlementCacheExpired = true
         if let uid = authService.session?.uid {
+            membershipSyncOutcome = .cancelled(uid: uid)
+        } else {
+            membershipSyncOutcome = .idle
+        }
+        lastKnownSessionUID = nil
+        if let uid = authService.session?.uid {
             UserDefaults.standard.removeObject(forKey: Self.checkoutLockPrefix + uid)
         }
         if let markerUID {
             UserDefaults.standard.removeObject(forKey: Self.reconcileMarkerKey(for: markerUID))
+        }
+        if let checkoutFallbackUID {
+            UserDefaults.standard.removeObject(
+                forKey: Self.checkoutReturnReconcileKey(for: checkoutFallbackUID)
+            )
         }
         KeychainStore.remove(service: Self.keychainService, account: Self.keychainAccount)
     }
@@ -1617,6 +1986,8 @@ final class PortalyCheckoutService: ObservableObject {
         case "PORTALY_RECOVERY_AMBIGUOUS", "SUBSCRIPTION_RECOVERY_AMBIGUOUS",
              "RECOVERY_SUBSCRIPTION_AMBIGUOUS":
             return .ambiguous
+        case "ACCOUNT_DELETION_SAFETY_HOLD", "SUBSCRIPTION_RECOVERY_SAFETY_HOLD":
+            return .safetyHold
         case "PORTALY_RECOVERY_CONFLICT", "SUBSCRIPTION_RECOVERY_CONFLICT",
              "RECOVERY_LOCAL_STATE_CONFLICT", "RECOVERY_EXISTING_BINDING_CONFLICT",
              "RECOVERY_PENDING_CHECKOUT", "PENDING_CHECKOUT_EXISTS", "CHECKOUT_SAFETY_HOLD":
@@ -1684,6 +2055,14 @@ final class PortalyCheckoutService: ObservableObject {
         UserDefaults.standard.bool(forKey: reconcileMarkerKey(for: uid))
     }
 
+    private static func checkoutReturnReconcileKey(for uid: String) -> String {
+        checkoutReturnReconcilePrefix + uid
+    }
+
+    private static func readCheckoutReturnReconcileRetries(for uid: String) -> Int {
+        max(UserDefaults.standard.integer(forKey: checkoutReturnReconcileKey(for: uid)), 0)
+    }
+
     private func loadReconcileMarkerIfNeeded() {
         guard let uid = authService.session?.uid else {
             reconcileMarkerUID = nil
@@ -1711,15 +2090,82 @@ final class PortalyCheckoutService: ObservableObject {
         }
     }
 
+    private func loadCheckoutReturnReconcileRetriesIfNeeded() {
+        guard let uid = authService.session?.uid else {
+            checkoutReturnReconcileUID = nil
+            checkoutReturnReconcileRetries = 0
+            return
+        }
+        guard checkoutReturnReconcileUID != uid else { return }
+        checkoutReturnReconcileUID = uid
+        checkoutReturnReconcileRetries = Self.readCheckoutReturnReconcileRetries(for: uid)
+    }
+
+    private func armCheckoutReturnReconcileRetryIfNeeded() {
+        loadCheckoutReturnReconcileRetriesIfNeeded()
+        guard let uid = authService.session?.uid else { return }
+        let retries = Self.armCheckoutReturnReconcileRetries(
+            current: checkoutReturnReconcileRetries
+        )
+        guard retries != checkoutReturnReconcileRetries else { return }
+        checkoutReturnReconcileRetries = retries
+        UserDefaults.standard.set(retries, forKey: Self.checkoutReturnReconcileKey(for: uid))
+        setReconcileMarker(true)
+    }
+
+    private func consumeCheckoutReturnReconcileRetryIfNeeded() -> Bool {
+        loadCheckoutReturnReconcileRetriesIfNeeded()
+        guard let uid = authService.session?.uid,
+              checkoutReturnReconcileRetries > 0 else {
+            return false
+        }
+        let remaining = Self.consumeCheckoutReturnReconcileRetries(
+            current: checkoutReturnReconcileRetries
+        )
+        checkoutReturnReconcileRetries = remaining
+        let key = Self.checkoutReturnReconcileKey(for: uid)
+        if remaining > 0 {
+            UserDefaults.standard.set(remaining, forKey: key)
+        } else {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
+        return true
+    }
+
+    private func clearCheckoutReturnReconcileRetries() {
+        guard let uid = authService.session?.uid else {
+            checkoutReturnReconcileUID = nil
+            checkoutReturnReconcileRetries = 0
+            return
+        }
+        checkoutReturnReconcileUID = uid
+        checkoutReturnReconcileRetries = 0
+        UserDefaults.standard.removeObject(forKey: Self.checkoutReturnReconcileKey(for: uid))
+    }
+
     private func authenticatedRequest<Response: Decodable>(
         path: String,
-        method: String
+        method: String,
+        ownerUID: String? = nil
     ) async throws -> Response {
-        loadingRequestCount += 1
-        isLoading = true
+        if let ownerUID, authService.session?.uid != ownerUID {
+            throw CancellationError()
+        }
+        let requestUID = ownerUID ?? authService.session?.uid
+        if let requestUID {
+            loadingRequestCounts[requestUID, default: 0] += 1
+        }
+        updateLoadingState()
         defer {
-            loadingRequestCount = max(0, loadingRequestCount - 1)
-            isLoading = loadingRequestCount > 0
+            if let requestUID,
+               let count = loadingRequestCounts[requestUID] {
+                if count <= 1 {
+                    loadingRequestCounts.removeValue(forKey: requestUID)
+                } else {
+                    loadingRequestCounts[requestUID] = count - 1
+                }
+            }
+            updateLoadingState()
         }
 
         let token = try await authService.validIDToken()

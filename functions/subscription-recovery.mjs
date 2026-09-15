@@ -14,7 +14,7 @@ export const RECOVERY_LOCK_STATUS = "recovery_in_progress";
 // indefinitely. The final transaction always re-checks the lease owner.
 export const RECOVERY_LEASE_MS = 5 * 60 * 1000;
 
-const RECOVERABLE_STATUSES = new Set(["active", "past_due"]);
+const RECOVERABLE_STATUSES = new Set(["active", "past_due", "cancel_requested"]);
 const TERMINAL_STATUSES = new Set(["canceled", "checkout_failed", "none"]);
 const PENDING_STATUSES = new Set(["pending", "created", "checkout_ready"]);
 const ACTIVE_STATUSES = new Set(["active", "past_due", "cancel_requested"]);
@@ -204,6 +204,18 @@ export function recoveredSubscriptionState({
 }
 
 /**
+ * A list response can race a detail response: Portaly may list a subscription
+ * as active while the detail endpoint already reports it canceled.  Treat the
+ * provider's terminal detail as a normal no-match result, while preserving a
+ * distinct state-change error for any non-terminal inconsistency.
+ */
+export function recoveryProviderDetailDecision({recoverable = false, subscriptionStatus} = {}) {
+  if (recoverable === true) return {kind: "recoverable"};
+  if (subscriptionStatus === "canceled") return {kind: "not_found"};
+  return {kind: "state_changed"};
+}
+
+/**
  * Build the logical user state used for a recovery response.  The Firestore
  * write patch may contain FieldValue.delete() transforms for optional fields
  * omitted by the latest provider response; those transforms must never be
@@ -359,8 +371,29 @@ export function recoveryLockDecision(
   if (lock.planId !== planId || lock.mode !== mode) {
     return {kind: "conflict", code: "RECOVERY_LOCK_SCOPE_CONFLICT"};
   }
-  if (["account_deleting", "account_deleted"].includes(lock.status)) {
+  if (lock.status === "account_deleting") {
     return {kind: "conflict", code: "ACCOUNT_DELETION_IN_PROGRESS"};
+  }
+  if (lock.status === "account_deleted") {
+    // Account deletion intentionally leaves one email-scoped tombstone so a
+    // new Firebase UID cannot silently reuse the old checkout.  The bounded
+    // deletion safety window must elapse before a verified recovery may
+    // inspect the provider for that email.  Only a complete tombstone proves
+    // that the old UID was deleted; legacy or malformed copies remain
+    // fail-closed rather than becoming an ownership shortcut.
+    const accountUidHash = nonBlankString(lock.accountUidHash);
+    const safetyHoldUntilMs = timestampMs(lock.safetyHoldUntilMs);
+    if (!accountUidHash || Object.prototype.hasOwnProperty.call(lock, "uid") ||
+        !Number.isFinite(safetyHoldUntilMs)) {
+      return {kind: "conflict", code: "ACCOUNT_DELETION_TOMBSTONE_INVALID"};
+    }
+    if (safetyHoldUntilMs > now) {
+      // The hold prevents an immediate same-email reclaim, but a verified
+      // account may perform a read-only provider inspection.  The caller must
+      // restore this tombstone on any provider error or renewable result.
+      return {kind: "inspection_only_tombstone", accountUidHash};
+    }
+    return {kind: "reclaimable_tombstone", accountUidHash};
   }
   if (lock.status === RECOVERY_LOCK_STATUS) {
     const leaseExpiresAtMs = timestampMs(lock.leaseExpiresAtMs);

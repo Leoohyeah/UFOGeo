@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import {createHash} from "node:crypto";
 import test from "node:test";
 
 import {checkoutLeaseDecision} from "../checkout-idempotency.mjs";
@@ -10,10 +11,12 @@ import {
   recoveryBindingDecision,
   recoveryLockDecision,
   recoveryLockIsActive,
+  recoveryProviderDetailDecision,
   recoveryResponseData,
   recoveryResponseEnvelope,
   selectRecoverableSubscription,
 } from "../subscription-recovery.mjs";
+import {subscriptionRecoveryOwnershipPlan} from "../subscription-ownership.mjs";
 import {subscriptionStateResponse} from "../subscription-response.mjs";
 
 const planId = "JO5cmDQdqTtb6AkkcnNW";
@@ -46,6 +49,18 @@ function detail(overrides = {}) {
 
 function errorCode(fn, code) {
   assert.throws(fn, (error) => error?.code === code);
+}
+
+function deletedAccountCancellation(overrides = {}) {
+  return {
+    id: "cancel-compensation-1",
+    subscriptionId: "sub_123",
+    planId,
+    mode: "test",
+    accountDeletionId: "deletion-1",
+    status: "pending",
+    ...overrides,
+  };
 }
 
 test("selects the sole active or past_due subscription in the server scope", () => {
@@ -212,6 +227,21 @@ test("accepts past_due recovery but not canceled recovery", () => {
   });
   assert.equal(canceling.recoverable, true);
   assert.equal(canceling.state.subscriptionStatus, "cancel_requested");
+});
+
+test("maps a canceled detail race to not_found instead of a recovery conflict", () => {
+  assert.deepEqual(recoveryProviderDetailDecision({
+    recoverable: false,
+    subscriptionStatus: "canceled",
+  }), {kind: "not_found"});
+  assert.deepEqual(recoveryProviderDetailDecision({
+    recoverable: false,
+    subscriptionStatus: "active",
+  }), {kind: "state_changed"});
+  assert.deepEqual(recoveryProviderDetailDecision({
+    recoverable: true,
+    subscriptionStatus: "cancel_requested",
+  }), {kind: "recoverable"});
 });
 
 test("uses the canonical recovery success envelope for every outcome", () => {
@@ -445,4 +475,98 @@ test("rejects invalid or cross-environment recovery locks", () => {
     kind: "conflict",
     code: "RECOVERY_LOCK_INVALID",
   });
+});
+
+test("allows only a complete account-deletion tombstone to enter provider-backed reclaim", () => {
+  const now = Date.parse("2026-09-07T00:00:00.000Z");
+  assert.deepEqual(recoveryLockDecision({
+    status: "account_deleted",
+    accountUidHash: "old-uid-hash",
+    safetyHoldUntilMs: now - 1,
+    planId,
+    mode: "test",
+  }, {planId, mode: "test", now}), {
+    kind: "reclaimable_tombstone",
+    accountUidHash: "old-uid-hash",
+  });
+  for (const lock of [
+    {status: "account_deleted", accountUidHash: "old-uid-hash", planId, mode: "test"},
+    {status: "account_deleted", accountUidHash: "old-uid-hash", safetyHoldUntilMs: now - 1, uid: "old-user", planId, mode: "test"},
+    {status: "account_deleting", accountUidHash: "old-uid-hash", planId, mode: "test"},
+  ]) {
+    assert.deepEqual(recoveryLockDecision(lock, {planId, mode: "test", now}), {
+      kind: "conflict",
+      code: lock.status === "account_deleted" ? "ACCOUNT_DELETION_TOMBSTONE_INVALID" :
+        "ACCOUNT_DELETION_IN_PROGRESS",
+    });
+  }
+  assert.deepEqual(recoveryLockDecision({
+    status: "account_deleted",
+    accountUidHash: "old-uid-hash",
+    safetyHoldUntilMs: now + 1,
+    planId,
+    mode: "test",
+  }, {planId, mode: "test", now}), {
+    kind: "inspection_only_tombstone",
+    accountUidHash: "old-uid-hash",
+  });
+});
+
+test("blocks deleted-account reclaim until cancellation compensation is complete", () => {
+  const deletedSession = {
+    uid: "deleted-uid",
+    accountDeleted: true,
+    sessionId: "sub_123",
+    subscriptionId: "sub_123",
+    customerEmail: scope.email,
+    planId,
+    mode: "test",
+  };
+  const deletedAccountUidHash = createHash("sha256")
+    .update(deletedSession.uid)
+    .digest("hex");
+  const base = {
+    ownerEntries: [],
+    refundMarkerEntries: [],
+    uid: "new-uid",
+    email: scope.email,
+    planId,
+    mode: "test",
+    subscriptionId: deletedSession.subscriptionId,
+    deletedAccountUidHash,
+    allowDeletedOwnership: deletedSession.accountDeleted,
+  };
+
+  for (const status of ["pending", "processing", "retry_pending"]) {
+    assert.deepEqual(subscriptionRecoveryOwnershipPlan({
+      ...base,
+      compensationEntries: [{data: deletedAccountCancellation({status})}],
+    }), {
+      kind: "conflict",
+      code: "SUBSCRIPTION_RECOVERY_SAFETY_HOLD",
+    });
+  }
+
+  const completed = subscriptionRecoveryOwnershipPlan({
+    ...base,
+    compensationEntries: [{data: deletedAccountCancellation({status: "completed"})}],
+    // A refund marker is a separate reconciliation workflow and remains
+    // eligible for the existing deleted-UID rebind after cancellation safety.
+    refundMarkerEntries: [{data: {
+      uid: deletedSession.uid,
+      customerEmail: scope.email,
+      planId,
+      mode: "test",
+      sessionId: deletedSession.subscriptionId,
+      subscriptionId: deletedSession.subscriptionId,
+      status: "pending",
+    }}],
+  });
+  assert.equal(completed.kind, "allow");
+  assert.deepEqual(completed.ownerDecision, {kind: "claim"});
+  assert.deepEqual(completed.markerDecisions, [{
+    kind: "rebind",
+    uid: "new-uid",
+    email: scope.email,
+  }]);
 });

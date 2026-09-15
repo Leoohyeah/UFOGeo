@@ -60,6 +60,111 @@ struct PortalyCheckoutServiceTests {
         #expect(message == "此帳號已有有效訂閱，請前往 Portaly 管理現有訂閱。")
     }
 
+    @Test func subscriptionRecoveryConflictUsesOwnershipSafeGuidance() {
+        let message = PortalyCheckoutService.serverErrorMessage(
+            code: "SUBSCRIPTION_RECOVERY_CONFLICT",
+            serverMessage: "backend conflict"
+        )
+
+        #expect(message == "目前帳號已有不同的訂閱狀態，為避免覆寫資料，請重新同步或聯絡支援。")
+    }
+
+    @Test func accountAndSubscriptionSafetyHoldsUseDeletionSafetyGuidance() {
+        for code in [
+            "ACCOUNT_DELETION_SAFETY_HOLD",
+            "SUBSCRIPTION_RECOVERY_SAFETY_HOLD",
+        ] {
+            let message = PortalyCheckoutService.serverErrorMessage(
+                code: code,
+                serverMessage: "ownership conflict"
+            )
+
+            #expect(message == "刪帳安全確認尚未完成，請稍後再試。")
+        }
+    }
+
+    @Test func sharedMembershipTasksCannotCrossFirebaseUIDs() {
+        #expect(
+            PortalyCheckoutService.requestTaskBelongsToCurrentUID(
+                ownerUID: "uid-1",
+                currentUID: "uid-1"
+            )
+        )
+        #expect(
+            !PortalyCheckoutService.requestTaskBelongsToCurrentUID(
+                ownerUID: "uid-1",
+                currentUID: "uid-2"
+            )
+        )
+        #expect(
+            !PortalyCheckoutService.requestTaskBelongsToCurrentUID(
+                ownerUID: nil,
+                currentUID: "uid-1"
+            )
+        )
+        #expect(
+            !PortalyCheckoutService.requestTaskBelongsToCurrentUID(
+                ownerUID: "uid-1",
+                currentUID: nil
+            )
+        )
+    }
+
+    @Test @MainActor func membershipSyncOutcomeProjectsTerminalStateOnlyForCurrentUID() {
+        let inFlight = PortalyCheckoutService.initialSyncFlags(
+            outcome: .inFlight(uid: "uid-1"),
+            currentUID: "uid-1"
+        )
+        #expect(!inFlight.completed)
+        #expect(!inFlight.failed)
+
+        let succeeded = PortalyCheckoutService.initialSyncFlags(
+            outcome: .succeeded(uid: "uid-1"),
+            currentUID: "uid-1"
+        )
+        #expect(succeeded.completed)
+        #expect(!succeeded.failed)
+
+        let failed = PortalyCheckoutService.initialSyncFlags(
+            outcome: .failed(uid: "uid-1"),
+            currentUID: "uid-1"
+        )
+        #expect(!failed.completed)
+        #expect(failed.failed)
+
+        let cancelled = PortalyCheckoutService.initialSyncFlags(
+            outcome: .cancelled(uid: "uid-1"),
+            currentUID: "uid-1"
+        )
+        #expect(!cancelled.completed)
+        #expect(cancelled.failed)
+
+        let switchedUID = PortalyCheckoutService.initialSyncFlags(
+            outcome: .failed(uid: "uid-1"),
+            currentUID: "uid-2"
+        )
+        #expect(!switchedUID.completed)
+        #expect(!switchedUID.failed)
+
+        let switchedAfterSuccess = PortalyCheckoutService.initialSyncFlags(
+            outcome: .succeeded(uid: "uid-1"),
+            currentUID: "uid-2"
+        )
+        #expect(!switchedAfterSuccess.completed)
+        #expect(!switchedAfterSuccess.failed)
+
+        let projection = PortalyCheckoutService.membershipProjection(
+            subscription: nil,
+            currentUID: "uid-1",
+            emailVerified: true,
+            validatedAt: nil,
+            isCacheExpired: true,
+            initialSyncCompleted: failed.completed,
+            syncFailed: failed.failed
+        )
+        #expect(projection.entitlement == .unavailable)
+    }
+
     @Test func otherServerErrorsPreferBackendMessage() {
         let message = PortalyCheckoutService.serverErrorMessage(
             code: "CHECKOUT_IN_PROGRESS",
@@ -249,6 +354,7 @@ struct PortalyCheckoutServiceTests {
             .ambiguous,
             .unavailable,
             .conflict,
+            .safetyHold,
         ]
         let checkoutAllowedStates: [PortalyCheckoutService.SubscriptionRecoveryState] = [
             .idle,
@@ -889,6 +995,30 @@ struct PortalyCheckoutServiceTests {
                 previous: nil,
                 latest: state("active", proActive: true)
             )
+        )
+    }
+
+    @Test func checkoutReturnFallbackRetryArmingIsBoundedAndIdempotent() {
+        #expect(
+            PortalyCheckoutService.armCheckoutReturnReconcileRetries(current: 0) == 1
+        )
+        #expect(
+            PortalyCheckoutService.armCheckoutReturnReconcileRetries(current: 1) == 1
+        )
+        #expect(
+            PortalyCheckoutService.armCheckoutReturnReconcileRetries(
+                current: 2,
+                limit: 1
+            ) == 2
+        )
+    }
+
+    @Test func checkoutReturnFallbackRetryConsumptionStopsAtZero() {
+        #expect(
+            PortalyCheckoutService.consumeCheckoutReturnReconcileRetries(current: 1) == 0
+        )
+        #expect(
+            PortalyCheckoutService.consumeCheckoutReturnReconcileRetries(current: 0) == 0
         )
     }
 

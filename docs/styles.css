@@ -101,6 +101,18 @@
     .step p{color:var(--muted);font-size:14px;line-height:1.7}
     .install-guide .step{height:100%}
     .install-guide .install-links{margin-top:14px}
+    .install-guide .install-links li{
+      display:block;
+      position:relative;
+      padding-left:24px;
+      line-height:1.75;
+    }
+    .install-guide .install-links li:before{
+      position:absolute;
+      left:0;
+      top:.18em;
+      line-height:1;
+    }
     .install-guide .install-list{margin:14px 0 0;padding-left:22px;display:grid;gap:8px;color:#c7d8e8;font-size:14px;line-height:1.7}
     .install-guide .install-list a,
     .install-guide .install-links a,

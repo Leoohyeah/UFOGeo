@@ -1,9 +1,8 @@
 import SwiftUI
 
 struct SubscriptionAccountView: View {
-    private static let initialSyncRetryDelayNanoseconds: UInt64 = 1_000_000_000
     private static let privacyPolicyURL = URL(
-        string: "https://ufogeo-adac7.web.app/privacy/"
+        string: "https://leoohyeah.github.io/UFOGeo/privacy/"
     )!
     private static let supportURL = URL(
         string: "mailto:leoohyeah.app@gmail.com"
@@ -28,7 +27,6 @@ struct SubscriptionAccountView: View {
     @State private var showDeleteConfirmation = false
     @State private var initialSubscriptionSyncCompleted = false
     @State private var initialSubscriptionSyncFailed = false
-    @State private var initialSubscriptionSyncInFlight = false
 
     var body: some View {
         // Intentionally avoid lifecycle-triggered sync here. This screen is a
@@ -46,6 +44,13 @@ struct SubscriptionAccountView: View {
         }
         .navigationTitle("帳號與訂閱")
         .navigationBarTitleDisplayMode(.inline)
+        .onChange(of: auth.session?.uid) { _, _ in
+            // The view can survive a sign-out/sign-in cycle. Do not let the
+            // previous UID's terminal sync flags make the new account appear
+            // unavailable before its own membership request completes.
+            initialSubscriptionSyncCompleted = false
+            initialSubscriptionSyncFailed = false
+        }
         .disabled(isBusy)
         .overlay {
             if isBusy {
@@ -254,9 +259,9 @@ struct SubscriptionAccountView: View {
                     }
                 } label: {
                     Label(
-                        portaly.isPortalRequestInFlight
+                        portaly.isPortalRequestInFlightForCurrentSession
                             ? "正在開啟訂閱管理…"
-                            : membershipProjection.action.title ?? "管理訂閱",
+                            : "管理訂閱",
                         systemImage: "creditcard.and.123"
                     )
                         .frame(maxWidth: .infinity)
@@ -383,17 +388,17 @@ struct SubscriptionAccountView: View {
 
     private var isBusy: Bool {
         auth.isWorking
-            || portaly.isLoading
-            || portaly.isCheckoutRequestInFlight
-            || portaly.isPortalRequestInFlight
+            || portaly.isLoadingForCurrentSession
+            || portaly.isCheckoutRequestInFlightForCurrentSession
+            || portaly.isPortalRequestInFlightForCurrentSession
             || portaly.isRecoveryRequestInFlight
-            || initialSubscriptionSyncInFlight
     }
 
     private var membershipProjection: PortalyCheckoutService.MembershipProjection {
-        portaly.membershipProjection(
-            initialSyncCompleted: initialSubscriptionSyncCompleted,
-            syncFailed: initialSubscriptionSyncFailed
+        let sharedSyncFlags = portaly.membershipSyncFlagsForCurrentSession
+        return portaly.membershipProjection(
+            initialSyncCompleted: initialSubscriptionSyncCompleted || sharedSyncFlags.completed,
+            syncFailed: initialSubscriptionSyncFailed || sharedSyncFlags.failed
         )
     }
 
@@ -414,7 +419,7 @@ struct SubscriptionAccountView: View {
             return .blue
         case .notFound:
             return .secondary
-        case .ambiguous, .unavailable, .conflict:
+        case .ambiguous, .unavailable, .conflict, .safetyHold:
             return .orange
         case .idle:
             return .secondary
@@ -425,13 +430,13 @@ struct SubscriptionAccountView: View {
         if portaly.isRecoveryRequestInFlight {
             return "正在從 Portaly 恢復…"
         }
-        if initialSubscriptionSyncInFlight || portaly.isLoading {
+        if portaly.isLoadingForCurrentSession {
             return "正在確認最新會員狀態…"
         }
-        if portaly.isCheckoutRequestInFlight {
+        if portaly.isCheckoutRequestInFlightForCurrentSession {
             return "正在建立付款頁面…"
         }
-        if portaly.isPortalRequestInFlight {
+        if portaly.isPortalRequestInFlightForCurrentSession {
             return "正在開啟訂閱管理…"
         }
         return "請稍候…"
@@ -483,20 +488,20 @@ struct SubscriptionAccountView: View {
     }
 
     private var checkoutActionTitle: String {
-        if portaly.isCheckoutRequestInFlight {
+        if portaly.isCheckoutRequestInFlightForCurrentSession {
             return "正在建立付款頁面…"
         }
         if portaly.isCheckoutLocked {
             return "付款頁面已建立，請稍候…"
         }
-        return membershipProjection.action.title ?? "訂閱 UFOGeo Pro"
+        return "訂閱 UFOGeo Pro"
     }
 
     private var recoveryActionTitle: String {
         switch portaly.recoveryState {
         case .notFound:
             return "再次尋找既有訂閱"
-        case .ambiguous, .unavailable, .conflict:
+        case .ambiguous, .unavailable, .conflict, .safetyHold:
             return "重新嘗試恢復訂閱"
         default:
             return "從 Portaly 恢復既有訂閱"
@@ -557,36 +562,6 @@ struct SubscriptionAccountView: View {
                 initialSubscriptionSyncFailed = true
             }
             if showError { presentError(error) }
-        }
-    }
-
-    private func refreshInitialAccountAndSubscription(expectedUID: String) async {
-        guard !initialSubscriptionSyncInFlight else { return }
-        if portaly.hasRecentlyValidatedEntitlement,
-           auth.session?.uid == expectedUID {
-            initialSubscriptionSyncCompleted = true
-            initialSubscriptionSyncFailed = false
-            return
-        }
-        initialSubscriptionSyncInFlight = true
-        defer { initialSubscriptionSyncInFlight = false }
-        for attempt in 0..<2 {
-            guard !Task.isCancelled else { return }
-            if attempt > 0 {
-                do {
-                    try await Task.sleep(nanoseconds: Self.initialSyncRetryDelayNanoseconds)
-                } catch {
-                    return
-                }
-            }
-            await refreshAccountAndSubscription(
-                force: true,
-                showError: false,
-                expectedUID: expectedUID
-            )
-            guard !Task.isCancelled else { return }
-            guard auth.session?.uid == expectedUID else { return }
-            if initialSubscriptionSyncCompleted { return }
         }
     }
 

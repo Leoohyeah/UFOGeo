@@ -37,7 +37,7 @@
             透過裝置配對、GPS 模擬與路線控制，讓位置功能驗證更直覺、更有效率。
           </p>
           <div class="hero-actions">
-            <a class="btn primary" href="sidestore://install?url=https://github.com/Leoohyeah/UFOGeo/releases/latest/download/UFOGeo.ipa" target="_blank" rel="noopener">⬇ 安裝 UFOGeo IPA</a>
+            <a class="btn primary" href="livecontainer://install?url=https://github.com/Leoohyeah/UFOGeo/releases/latest/download/UFOGeo.ipa" target="_blank" rel="noopener">⬇ 安裝 UFOGeo IPA</a>
             <a class="btn secondary" href="https://github.com/Leoohyeah/UFOGeo" target="_blank" rel="noopener">↗ 查看 GitHub</a>
           </div>
           <div class="hero-note">僅供合法的開發、測試、研究與教育用途。</div>
@@ -175,48 +175,52 @@
       <div class="wrap">
         <div class="section-head">
           <div class="kicker">Installation Guide</div>
-          <h2 id="setup-title">安裝教學：4 個階段開始使用</h2>
-          <p class="sub">依序準備工具、安裝 SideStore、下載 UFOGeo IPA，再完成 iOS 首次啟動設定。</p>
+          <h2 id="setup-title">安裝教學：依 README 的 4 個階段完成設定</h2>
+          <p class="sub">依序準備工具、安裝 LiveContainer + SideStore、完成 iOS 端設定，最後在 LiveContainer 執行 UFOGeo。</p>
         </div>
 
         <div class="steps install-steps">
           <article class="card step">
             <div class="step-no">STEP 01</div>
             <h3>首次準備工具</h3>
-            <p>準備一台 Mac 或 Windows 電腦、一台 iOS 裝置，以及下列工具。</p>
+            <p>準備一台 Mac 或 Windows 電腦、一台 iOS 裝置，並先完成必要前置。</p>
             <ul class="checklist install-links">
-              <li>Mac：<a href="https://github.com/nab138/iloader/releases/latest/download/iloader-darwin-universal.dmg" target="_blank" rel="noopener">下載 iLoader DMG</a></li>
-              <li>Windows：<a href="https://apple.co/ms" target="_blank" rel="noopener">iTunes</a>、<a href="https://github.com/nab138/iloader/releases/latest/download/iloader-windows-x64.exe" target="_blank" rel="noopener">iLoader EXE</a> 或 <a href="https://github.com/nab138/iloader/releases/latest/download/iloader-windows-x64.msi" target="_blank" rel="noopener">MSI</a>。</li>
-              <li>iOS：安裝 <a href="https://apps.apple.com/us/app/localdevvpn/id6755608044" target="_blank" rel="noopener">LocalDevVPN</a>，並開啟「開發者模式」。</li>
+              <li>Mac：<a href="https://github.com/claration/Impactor/releases/latest/download/Impactor-macos-universal.dmg" target="_blank" rel="noopener">下載 Impactor DMG</a></li>
+              <li>Windows：安裝 <a href="https://apple.co/ms" target="_blank" rel="noopener">iTunes</a>，再依系統下載 Impactor <a href="https://github.com/claration/Impactor/releases/latest/download/Impactor-windows-x86-portable.exe" target="_blank" rel="noopener">32 位元</a> / <a href="https://github.com/claration/Impactor/releases/latest/download/Impactor-windows-x86_64-portable.exe" target="_blank" rel="noopener">64 位元</a>。</li>
+              <li>iOS：安裝 <a href="https://apps.apple.com/us/app/localdevvpn/id6755608044" target="_blank" rel="noopener">LocalDevVPN</a>。</li>
+              <li>iOS：開啟「開發者模式」，連接電腦並完成信任</li>
             </ul>
           </article>
           <article class="card step">
             <div class="step-no">STEP 02</div>
-            <h3>安裝 SideStore</h3>
-            <p>用 iLoader 與自己的 iPhone 完成配對，再安裝 SideStore。</p>
+            <h3>安裝 LiveContainer + SideStore</h3>
+            <p>先用 Impactor 安裝 LiveContainer+SideStore，再放置遠端配對檔。</p>
             <ol class="install-list">
-              <li>安裝並開啟對應的 iLoader。</li>
-              <li>登入 Apple ID，與 iPhone 完成配對。</li>
-              <li>選擇安裝 SideStore (每夜建置)。</li>
+              <li>下載 <a href="https://github.com/LiveContainer/LiveContainer/releases/download/nightly/LiveContainer+SideStore.ipa" target="_blank" rel="noopener">LiveContainer+SideStore.ipa</a>。</li>
+              <li>開啟 Impactor，點擊右上角齒輪，新增帳號並登入 Apple ID。</li>
+              <li>點擊「匯入 .ipa」，選擇 LiveContainer+SideStore.ipa 完成安裝。</li>
+              <li>安裝完成後點擊「工具」→ 開啟「使用遠端配對」→ 放置配對檔案。</li>
             </ol>
           </article>
           <article class="card step">
             <div class="step-no">STEP 03</div>
-            <h3>安裝 UFOGeo IPA</h3>
-            <p>在 iOS 執行 SideStore</p>
+            <h3>在 iOS 執行 LiveContainer App</h3>
+            <p>先完成信任與 LocalDevVPN，再透過 SideStore 載入證書與安裝 IPA。</p>
             <ol class="install-list">
               <li>前往「設定 → 一般 → VPN 與裝置管理」，信任簽署開發者憑證。</li>
-              <li>開啟 LocalDevVPN，點選 Connect。</li>
-              <li>開啟 SideStore 點選右下角 Settings ，登入 Apple ID。</li>
-              <li><a href="sidestore://install?url=https://github.com/Leoohyeah/UFOGeo/releases/latest/download/UFOGeo.ipa" target="_blank" rel="noopener">安裝最新 UFOGeo IPA</a>。</li>
+              <li>開啟 LocalDevVPN 並連線。</li>
+              <li>開啟 LiveContainer，點擊下方 App，使用左上角「+」右邊圖示進入 SideStore App。</li>
+              <li>在 SideStore 點擊下方 Settings → 登入 Apple ID → 關閉 App。</li>
+              <li>重新開啟 LiveContainer，點擊右下角設定 → 從 SideStore 載入證書。</li>
+              <li><a href="livecontainer://install?url=https://github.com/Leoohyeah/UFOGeo/releases/latest/download/UFOGeo.ipa" target="_blank" rel="noopener">安裝最新版 UFOGeo</a></li>
             </ol>
           </article>
           <article class="card step">
             <div class="step-no">STEP 04</div>
-            <h3>首次在 iOS 執行</h3>
-            <p>完成信任、VPN 與安裝 UFOGeo 後，即可開始定位測試。</p>
+            <h3>在 LiveContainer 執行 UFOGeo</h3>
+            <p>匯入配對檔後即可開始定位測試。</p>
             <ol class="install-list">
-              <li>開啟 UFOGeo，在匯入配對檔案的位置選擇 → 右下角瀏覽 → SideStore → 點選<code>ALTPairingFile.mobiledevicepairing</code>。</li>
+              <li>執行 UFOGeo，在匯入配對檔案的位置選擇 → 右下角瀏覽 → LiveContainer → SideStore → Documents → 點選 <code>ALTPairingFile.mobiledevicepairing</code>。</li>
               <li>Wi-Fi 可直接使用；行動數據若連線異常，先開關一次行動數據或飛航模式。</li>
             </ol>
           </article>
@@ -235,9 +239,9 @@
               macOS
             </div>
             <ul class="checklist">
-              <li><a href="https://github.com/nab138/iloader/releases/latest/download/iloader-darwin-universal.dmg" target="_blank" rel="noopener">下載 iLoader</a></li>
+              <li><a href="https://github.com/claration/Impactor/releases/latest/download/Impactor-macos-universal.dmg" target="_blank" rel="noopener">下載 Impactor</a></li>
             </ul>
-            <div class="code">iLoader → 安裝 SideStore</div>
+            <div class="code">Impactor → 安裝 LiveContainer+SideStore</div>
           </div>
           <div class="card platform-card">
             <div class="platform-label">
@@ -255,9 +259,9 @@
             </div>
             <ul class="checklist">
               <li><a href="https://apple.co/ms" target="_blank" rel="noopener">下載 iTunes</a></li>
-              <li><a href="https://github.com/nab138/iloader/releases/latest/download/iloader-windows-x64.exe" target="_blank" rel="noopener">iLoader EXE</a> / <a href="https://github.com/nab138/iloader/releases/latest/download/iloader-windows-x64.msi" target="_blank" rel="noopener">MSI</a></li>
+              <li>Impactor <a href="https://github.com/claration/Impactor/releases/latest/download/Impactor-windows-x86-portable.exe" target="_blank" rel="noopener">32 位元</a> / <a href="https://github.com/claration/Impactor/releases/latest/download/Impactor-windows-x86_64-portable.exe" target="_blank" rel="noopener">64 位元</a></li>
             </ul>
-            <div class="code">iLoader → 安裝 SideStore</div>
+            <div class="code">Impactor → 安裝 LiveContainer+SideStore</div>
           </div>
         </div>
 
@@ -266,7 +270,7 @@
           <div style="font-size:24px">⚠️</div>
           <div>
             <b>iOS 使用前提醒</b>
-            <p>請開啟「開發者模式」。使用行動數據時，如連線異常，README 建議先開關一次行動數據或飛航模式，再進行測試。</p>
+            <p>請先開啟「開發者模式」，並確保裝置已連接電腦且完成信任。使用行動數據時若連線異常，先開關一次行動數據或飛航模式再測試。</p>
           </div>
         </div>
       </div>

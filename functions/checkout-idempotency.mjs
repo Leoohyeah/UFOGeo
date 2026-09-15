@@ -42,6 +42,17 @@ const CHECKOUT_TERMINAL_STATUSES = new Set([
   "canceled",
   "cancelled",
 ]);
+const CHECKOUT_PAID_SESSION_STATUSES = new Set([
+  "active",
+  "past_due",
+  "cancel_requested",
+  "completed",
+  "checkout_completed",
+]);
+const CHECKOUT_UNCERTAIN_SESSION_STATUSES = new Set([
+  "uncertain",
+  "response_incomplete",
+]);
 
 function nonBlankString(value) {
   if (typeof value !== "string") return null;
@@ -267,6 +278,63 @@ export function isReusableCheckoutSession(session, {planId, mode, now = Date.now
   return Number.isFinite(expiresAtMs) && expiresAtMs > now;
 }
 
+function authoritativeSessionFor(sessionId, authoritativeSessions) {
+  if (!(authoritativeSessions instanceof Map)) return undefined;
+  return authoritativeSessions.has(sessionId) ? authoritativeSessions.get(sessionId) : null;
+}
+
+/**
+ * Verify a reusable lock/fallback against the checkout session read in the
+ * same Firestore transaction. The transaction passes a Map of session ID to
+ * session data (or null when the document is missing); an omitted map
+ * preserves the helper's Firebase-free legacy behavior for callers that have
+ * no authoritative read.
+ */
+export function checkoutSessionReuseDecision(
+  candidate,
+  {authoritativeSessions, planId, mode, now = Date.now()} = {},
+) {
+  if (!planMatches(candidate, planId) || !modeMatches(candidate, mode)) {
+    return {kind: "not_reusable"};
+  }
+  const reusable = isReusableCheckoutSession(candidate, {planId, mode, now});
+  if (!reusable && !CHECKOUT_INITIAL_STATUSES.has(candidate?.status)) {
+    return {kind: "not_reusable"};
+  }
+  if (!(authoritativeSessions instanceof Map)) {
+    return reusable ? {kind: "unchecked"} : {kind: "not_reusable"};
+  }
+  if (!validSessionId(candidate?.sessionId)) return {kind: "not_reusable"};
+  const session = authoritativeSessionFor(candidate.sessionId, authoritativeSessions);
+  if (!session || typeof session !== "object" || Array.isArray(session)) {
+    return {kind: "safety_hold", status: "checkout_session_state_unknown"};
+  }
+  const candidateUid = nonBlankString(candidate.uid);
+  if (session.sessionId !== candidate.sessionId ||
+      !candidateUid || session.uid !== candidateUid ||
+      session.planId !== planId ||
+      (mode !== undefined && session.mode !== mode)) {
+    return {kind: "safety_hold", status: "checkout_session_identity_mismatch"};
+  }
+  if (CHECKOUT_PAID_SESSION_STATUSES.has(session.status)) {
+    return {kind: "blocked", status: session.status};
+  }
+  if (CHECKOUT_UNCERTAIN_SESSION_STATUSES.has(session.status)) {
+    return {kind: "safety_hold", status: session.status};
+  }
+  if (CHECKOUT_INITIAL_STATUSES.has(session.status)) {
+    return reusable ? {kind: "reuse"} : {kind: "safety_hold", status: "checkout_pending"};
+  }
+  if (CHECKOUT_TERMINAL_STATUSES.has(session.status)) return {kind: "terminal"};
+  return {kind: "safety_hold", status: "checkout_session_state_unknown"};
+}
+
+export function canReuseOrphanLockSnapshot({orphanLockPath, refPath, snapshotFetched} = {}) {
+  return snapshotFetched === true &&
+    typeof orphanLockPath === "string" && orphanLockPath.length > 0 &&
+    orphanLockPath === refPath;
+}
+
 export function checkoutLockMatchesSession(lock, sessionId, {mode} = {}) {
   return Boolean(
     lock &&
@@ -363,6 +431,7 @@ export function checkoutLeaseDecision({
   legacyLock = null,
   legacyLocks = [],
   fallbackSession = null,
+  authoritativeSessions,
   uid,
   planId,
   mode,
@@ -412,21 +481,46 @@ export function checkoutLeaseDecision({
 
   for (const candidate of candidates) {
     const currentCheckoutSessionId = subscription?.currentCheckoutSessionId;
+    const sessionDecision = checkoutSessionReuseDecision(candidate, {
+      authoritativeSessions,
+      uid,
+      planId,
+      mode,
+      now,
+    });
+    if (sessionDecision.kind === "blocked") return {kind: "blocked"};
+    if (sessionDecision.kind === "safety_hold") return sessionDecision;
+    if (sessionDecision.kind === "terminal") continue;
     if (
       lockOwnerMatches(candidate, uid) &&
       (!currentCheckoutSessionId || candidate?.sessionId === currentCheckoutSessionId) &&
-      isReusableCheckoutSession(candidate, {planId, mode, now})
+      ["reuse", "unchecked"].includes(sessionDecision.kind)
     ) {
       return {kind: "reuse", session: candidate};
     }
+    if (sessionDecision.kind === "reuse" && lockOwnerMatches(candidate, uid)) {
+      return {kind: "safety_hold", status: "checkout_pending"};
+    }
   }
   const currentCheckoutSessionId = subscription?.currentCheckoutSessionId;
+  const fallbackDecision = checkoutSessionReuseDecision(fallbackSession, {
+    authoritativeSessions,
+    uid,
+    planId,
+    mode,
+    now,
+  });
+  if (fallbackDecision.kind === "blocked") return {kind: "blocked"};
+  if (fallbackDecision.kind === "safety_hold") return fallbackDecision;
   if (
     lockOwnerMatches(fallbackSession, uid) &&
     (!currentCheckoutSessionId || fallbackSession?.sessionId === currentCheckoutSessionId) &&
-    isReusableCheckoutSession(fallbackSession, {planId, mode, now})
+    ["reuse", "unchecked"].includes(fallbackDecision.kind)
   ) {
     return {kind: "reuse", session: fallbackSession};
+  }
+  if (fallbackDecision.kind === "reuse" && lockOwnerMatches(fallbackSession, uid)) {
+    return {kind: "safety_hold", status: "checkout_pending"};
   }
 
   for (const candidate of allCandidates) {
@@ -455,6 +549,14 @@ export function checkoutLeaseDecision({
   // A checkout URL created for a previous Firebase account must not be handed
   // to the new account, even when both accounts verified the same email.
   for (const candidate of allCandidates) {
+    const sessionDecision = checkoutSessionReuseDecision(candidate, {
+      authoritativeSessions,
+      uid,
+      planId,
+      mode,
+      now,
+    });
+    if (["terminal", "not_reusable"].includes(sessionDecision.kind)) continue;
     if (
       candidate &&
       !lockOwnerMatches(candidate, uid) &&

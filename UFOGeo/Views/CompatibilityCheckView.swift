@@ -1,5 +1,6 @@
 import CoreLocation
 import SwiftUI
+import UIKit
 
 enum CompatibilityCheckScrollTarget {
     case walkingHealth
@@ -19,6 +20,7 @@ struct CompatibilityCheckView: View {
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
+    @Environment(\.scenePhase) private var scenePhase
     @EnvironmentObject private var sharedMapState: SharedLocationMapState
     @ObservedObject private var healthCoordinator = HealthWalkingCoordinator.shared
     @ObservedObject private var portaly = PortalyCheckoutService.shared
@@ -38,6 +40,7 @@ struct CompatibilityCheckView: View {
     @State private var simulationSpeedSlider = 10.0
     @State private var isDraggingSimulationSpeed = false
     @State private var pairingExists = false
+    @State private var locationAuthorizationStatus: CLAuthorizationStatus = CLLocationManager().authorizationStatus
     @State private var didInitialScroll = false
     @State private var batchSizeText = ""
     @State private var targetText = ""
@@ -72,11 +75,21 @@ struct CompatibilityCheckView: View {
                 List {
                     Section {
                         connectionOverview
+                        compactStatusRow("執行環境", value: runtimeEnvironment.displayName,
+                                         color: runtimeEnvironmentColor)
                         compactStatusRow("配對文件", value: pairingExists ? "已就緒" : "需要導入",
                                          color: pairingExists ? .green : .orange)
                         compactStatusRow("VPN Tunnel", value: tunnelCompactText, color: tunnelCompactColor)
                         compactStatusRow("背景定位權限", value: locationAuthorizationText,
                                          color: locationAuthorizationColor)
+
+                        if locationAuthorizationNeedsSettings {
+                            Button {
+                                openLocationSettings()
+                            } label: {
+                                Label("開啟定位設定", systemImage: "location.fill")
+                            }
+                        }
 
                         settingsAction("手動匯入配對文件", icon: "doc.badge.plus",
                                        color: pairingExists ? .accentColor : .orange) {
@@ -90,6 +103,8 @@ struct CompatibilityCheckView: View {
                         }
                     } header: {
                         Text("準備狀態")
+                    } footer: {
+                        Text(locationPermissionGuidance)
                     }
 
                     Section {
@@ -264,6 +279,7 @@ struct CompatibilityCheckView: View {
             }
             .onAppear {
                 refreshConnectionStatus()
+                refreshLocationAuthorization()
                 healthCoordinator.refreshEntitlement()
                 let speed = min(max(simulationSpeed, 0), 1000)
                 sharedMapState.simulationSpeed = speed
@@ -275,6 +291,10 @@ struct CompatibilityCheckView: View {
             }
             .onReceive(NotificationCenter.default.publisher(for: .pairingFileDidChange)) { _ in
                 refreshConnectionStatus()
+            }
+            .onChange(of: scenePhase) { _, phase in
+                guard phase == .active else { return }
+                refreshLocationAuthorization()
             }
             .onChange(of: simulationSpeed) { _, value in
                 sharedMapState.simulationSpeed = min(max(value, 0), 1000)
@@ -626,6 +646,25 @@ struct CompatibilityCheckView: View {
         sharedMapState.testTunnel()
     }
 
+    private func refreshLocationAuthorization() {
+        locationAuthorizationStatus = CLLocationManager().authorizationStatus
+    }
+
+    private var runtimeEnvironment: RuntimeEnvironment {
+        RuntimeEnvironment.current
+    }
+
+    private var runtimeEnvironmentColor: Color {
+        switch runtimeEnvironment {
+        case .liveContainer:
+            return .accentColor
+        case .standalone:
+            return .green
+        case .unknown:
+            return .secondary
+        }
+    }
+
     private var connectionOverviewIcon: String {
         if !pairingExists { return "doc.badge.ellipsis" }
         switch tunnelStatus {
@@ -654,7 +693,7 @@ struct CompatibilityCheckView: View {
     }
 
     private var locationAuthorizationText: String {
-        switch CLLocationManager().authorizationStatus {
+        switch locationAuthorizationStatus {
         case .authorizedAlways: return "已就緒（永遠）"
         case .authorizedWhenInUse: return "需改為「永遠」"
         case .denied: return "已拒絕"
@@ -665,12 +704,39 @@ struct CompatibilityCheckView: View {
     }
 
     private var locationAuthorizationColor: Color {
-        switch CLLocationManager().authorizationStatus {
+        switch locationAuthorizationStatus {
         case .authorizedAlways: return .green
         case .authorizedWhenInUse: return .orange
         case .denied, .restricted: return .red
         default: return .secondary
         }
+    }
+
+    private var locationAuthorizationNeedsSettings: Bool {
+        switch locationAuthorizationStatus {
+        case .authorizedWhenInUse, .denied, .restricted:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private var locationPermissionGuidance: String {
+        switch locationAuthorizationStatus {
+        case .authorizedAlways:
+            return "背景定位權限已就緒。"
+        case .authorizedWhenInUse, .denied, .restricted:
+            return runtimeEnvironment.locationPermissionGuidance
+        case .notDetermined:
+            return "開始使用定位時會詢問權限；若透過其他宿主執行，請在該宿主 App 的定位設定中選擇「永遠」。"
+        @unknown default:
+            return runtimeEnvironment.locationPermissionGuidance
+        }
+    }
+
+    private func openLocationSettings() {
+        guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+        openURL(url)
     }
 
     @ViewBuilder

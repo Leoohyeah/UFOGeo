@@ -1,8 +1,13 @@
 import {createHash} from "node:crypto";
 
 const PORTALY_MODES = new Set(["test", "live"]);
-const BLOCKING_STATUSES = new Set(["active", "past_due"]);
-const PORTALY_SUBSCRIPTION_STATUSES = new Set(["active", "past_due", "canceled"]);
+const BLOCKING_STATUSES = new Set(["active", "past_due", "cancel_requested"]);
+const PORTALY_SUBSCRIPTION_STATUSES = new Set([
+  "active",
+  "past_due",
+  "cancel_requested",
+  "canceled",
+]);
 
 function fail(code, message) {
   throw Object.assign(new Error(message), {code});

@@ -12,6 +12,22 @@ import CoreLocation
 
 struct UFOGeoTests {
 
+    @Test func updateActionsUseInstallPageAndSeparateIPADownloadURL() {
+        let ipaURL = UpdateCheckManager.latestIPADownloadURLString
+        let downloadURL = UpdateCheckManager.updateURL(for: .downloadIPA)
+        #expect(downloadURL?.absoluteString == ipaURL)
+
+        let installPageURL = UpdateCheckManager.updateURL(for: .liveContainer)
+        let components = installPageURL.flatMap {
+            URLComponents(url: $0, resolvingAgainstBaseURL: false)
+        }
+
+        #expect(components?.scheme == "https")
+        #expect(components?.host == "leoohyeah.github.io")
+        #expect(components?.path == "/UFOGeo/")
+        #expect(components?.queryItems?.first(where: { $0.name == "url" }) == nil)
+    }
+
     @Test func searchCompletionAcceptsOnlyTheCurrentQueryGenerationAndSession() {
         let currentSessionID = UUID()
         let staleSessionID = UUID()
@@ -586,51 +602,6 @@ struct UFOGeoTests {
             LaunchCoordinateReturnPolicy.fixedLocationAction(isSimulating: true)
                 == .updateSimulationAndHold
         )
-    }
-
-    @Test func pairingFileValidationAcceptsRequiredFields() throws {
-        let propertyList: [String: Any] = [
-            "HostID": "host-id",
-            "SystemBUID": "system-buid",
-            "DeviceCertificate": Data([1]),
-            "HostCertificate": Data([2]),
-            "HostPrivateKey": Data([3]),
-            "RootCertificate": Data([4]),
-            "RootPrivateKey": Data([5])
-        ]
-        let data = try PropertyListSerialization.data(
-            fromPropertyList: propertyList,
-            format: .binary,
-            options: 0
-        )
-
-        try PairingFileStore.validate(data)
-    }
-
-    @Test func pairingFileValidationRejectsMissingPrivateKey() throws {
-        let propertyList: [String: Any] = [
-            "HostID": "host-id",
-            "SystemBUID": "system-buid",
-            "DeviceCertificate": Data([1]),
-            "HostCertificate": Data([2]),
-            "RootCertificate": Data([4]),
-            "RootPrivateKey": Data([5])
-        ]
-        let data = try PropertyListSerialization.data(
-            fromPropertyList: propertyList,
-            format: .xml,
-            options: 0
-        )
-
-        #expect(throws: PairingFileError.self) {
-            try PairingFileStore.validate(data)
-        }
-    }
-
-    @Test func pairingFileValidationRejectsNonPropertyListData() {
-        #expect(throws: PairingFileError.self) {
-            try PairingFileStore.validate(Data("not a plist".utf8))
-        }
     }
 
     @Test func locationSimulationResultMapsTypedError() {

@@ -3,93 +3,80 @@ import SwiftUI
 /// 版本更新提示視圖
 struct UpdateAvailableView: View {
     @ObservedObject var updateManager: UpdateCheckManager
-    @State private var isDismissed = false
+    @State private var isShowingUpdateAlert = false
+    @State private var presentedVersion: String?
+    @State private var isShowingOpenError = false
+    @State private var openErrorMessage = ""
 
     var body: some View {
-        if !isDismissed, updateManager.hasUpdate, let latestVersion = updateManager.latestVersion {
-            VStack(spacing: 12) {
-                HStack {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("有新版本可用")
-                            .font(.headline)
-                            .foregroundColor(.white)
-
-                        Text("v\(latestVersion.versionNumber)")
-                            .font(.subheadline)
-                            .foregroundColor(.white.opacity(0.7))
-                    }
-
-                    Spacer()
-
-                    Button(action: {
-                        isDismissed = true
-                    }) {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.title2)
-                            .foregroundColor(.white.opacity(0.6))
-                    }
+        Color.clear
+            .frame(width: 0, height: 0)
+            .alert("有新版本可用", isPresented: $isShowingUpdateAlert) {
+                Button("前往 UFOGeo 首頁點擊安裝最新版") {
+                    openUpdate(.liveContainer)
                 }
-
-                if !latestVersion.body.isEmpty {
-                    Text(latestVersion.body.prefix(100) + "...")
-                        .font(.caption)
-                        .foregroundColor(.white.opacity(0.8))
-                        .lineLimit(2)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                Button("下載 IPA") {
+                    openUpdate(.downloadIPA)
                 }
-
-                HStack(spacing: 12) {
-                    Button(action: {
-                        updateManager.openUpdatePage()
-                    }) {
-                        Text("立即更新")
-                            .font(.subheadline)
-                            .fontWeight(.semibold)
-                            .foregroundColor(.white)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 8)
-                            .background(Color.blue)
-                            .cornerRadius(6)
-                    }
-
-                    Button(action: {
-                        isDismissed = true
-                    }) {
-                        Text("稍後")
-                            .font(.subheadline)
-                            .foregroundColor(.blue)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 8)
-                    }
-                }
+                Button("稍後", role: .cancel) { }
+            } message: {
+                Text(updateAlertMessage)
             }
-            .padding(12)
-            .background(Color.gray.opacity(0.3))
-            .cornerRadius(8)
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
+            .alert("無法開啟更新", isPresented: $isShowingOpenError) {
+                Button("確定", role: .cancel) {
+                    openErrorMessage = ""
+                }
+            } message: {
+                Text(openErrorMessage)
+            }
+            .onAppear {
+                presentUpdateAlertIfNeeded()
+            }
+            .onChange(of: updateManager.hasUpdate) { _, _ in
+                presentUpdateAlertIfNeeded()
+            }
+            .onChange(of: updateManager.latestVersion?.versionNumber) { _, _ in
+                presentUpdateAlertIfNeeded()
+            }
+    }
+
+    private var updateAlertMessage: String {
+        guard let latestVersion = updateManager.latestVersion else { return "" }
+
+        let body = latestVersion.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty else {
+            return "v\(latestVersion.versionNumber)"
+        }
+
+        let shortenedBody = String(body.prefix(100))
+        let suffix = body.count > 100 ? "..." : ""
+        return "v\(latestVersion.versionNumber)\n\(shortenedBody)\(suffix)"
+    }
+
+    private func presentUpdateAlertIfNeeded() {
+        guard updateManager.hasUpdate,
+              let version = updateManager.latestVersion?.versionNumber,
+              presentedVersion != version,
+              !isShowingUpdateAlert,
+              !isShowingOpenError else { return }
+
+        presentedVersion = version
+        isShowingUpdateAlert = true
+    }
+
+    private func openUpdate(_ target: UpdateInstallTarget) {
+        isShowingUpdateAlert = false
+
+        updateManager.openUpdate(target: target) { success in
+            guard !success else { return }
+
+            switch target {
+            case .liveContainer:
+                openErrorMessage = "無法開啟 UFOGeo 安裝網頁。請確認網路連線後，在瀏覽器開啟 https://leoohyeah.github.io/UFOGeo/，再點擊「安裝最新版」。"
+            case .downloadIPA:
+                openErrorMessage = "無法開啟 IPA 下載頁面，請確認網路連線後再試。"
+            }
+            isShowingOpenError = true
         }
     }
-}
-
-#Preview {
-    VStack {
-        UpdateAvailableView(
-            updateManager: {
-                let manager = UpdateCheckManager()
-                manager.hasUpdate = true
-                manager.latestVersion = AppVersion(
-                    tagName: "v1.1.0",
-                    name: "Version 1.1.0",
-                    body: "新增路線回放功能、修復位置更新延遲問題",
-                    releaseDate: "2026-07-29",
-                    downloadUrl: "https://github.com/Leoohyeah/UFOGeo/releases"
-                )
-                return manager
-            }()
-        )
-
-        Spacer()
-    }
-    .background(Color(.systemBackground))
 }
